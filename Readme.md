@@ -18,9 +18,6 @@ Right after :npm run dist
 
 Software size will be around 80-200MB
 
-Exmpale for live folder motion: add folders and whenever after anyupdate happens in folder(create,move,copy,etc)add and showed !
-local network: allow other to have access and use app in browser and fit in pc and phone size!
-
 This isn't not perfect and have some bugs!close and relunche app always works
 
 Enjoy using Ultimate Player! :)
