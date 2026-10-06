@@ -69,6 +69,8 @@ if (isElectron && _fs && _path) {
         FILES.layouts   = _path.join(DATA_DIR, 'layouts.json');
         FILES.custom    = _path.join(DATA_DIR, 'custom_layout.json');
         FILES.state     = _path.join(DATA_DIR, 'state.json');
+        FILES.queue     = _path.join(DATA_DIR, 'recent_queue.json');
+        FILES.startpoints = _path.join(DATA_DIR, 'start_points.json');
     } catch (e) {
         console.error('[store] Data path setup failed:', e);
     }
@@ -79,6 +81,8 @@ if (isElectron && _fs && _path) {
     FILES.layouts   = 'up_layouts';
     FILES.custom    = 'up_custom';
     FILES.state     = 'up_state';
+    FILES.queue     = 'up_recent_queue';
+    FILES.startpoints = 'up_start_points';
 }
 
 // ── I/O ───────────────────────────────────────────────────────
@@ -168,6 +172,7 @@ const DEFAULT_KEYS = {
     rewind:     'ArrowLeft',
     fullscreen: 'KeyF',
     next:       'KeyN',
+    prev:       'KeyB',         // FIX 10: dedicated Prev Batch shortcut
     home:       'KeyH',
     minimize:   'KeyM',
     sidebar:    'KeyS',
@@ -178,6 +183,8 @@ const DEFAULT_KEYS = {
     clearAll:   null,
     replayA:    null,
     replayB:    null,
+    startPoint: null,           // toggle: set / cancel start point (hovered cell)
+    endPoint:   null,           // toggle: set / cancel end point   (hovered cell)
     forward5:   null,
     backward5:  null,
     forward30:  null,
@@ -185,6 +192,7 @@ const DEFAULT_KEYS = {
     // RAM flush shortcut (default: G)
     ramFlush:   'KeyG'
 };
+window.DEFAULT_KEYS = DEFAULT_KEYS;
 
 // ── DEFAULT SETTINGS ──────────────────────────────────────────
 const DEFAULT_SETTINGS = {
@@ -195,11 +203,11 @@ const DEFAULT_SETTINGS = {
     bgIndex:          0,
     customBg:         null,
     bgImage:          null,
-    oled:             false,
-    wakeLock:         false,
     gridSize:         '1',
     effect:           'none',
     effectSpeed:      0.8,
+    videoEffect:      'none',
+    randomVideoEffect: false,
     gapSize:          10,
     gridRoundness:    0,
     ratioTolerance:   0.3,
@@ -216,15 +224,17 @@ const DEFAULT_SETTINGS = {
     liveSortMode:     'sequential',
     liveModifiers:    'shift_ctrl',
     liveFolders:      [],
-    showShortcuts:    true,
     showQueueInfo:    false,
+    customMixRatio:   { images: 1, videos: 1, random: false },
     autoFallback:     true,
     globalVolume:     1.0,
+    volumeBoost:      false,   // allow volume up to 1000% (sidebar + per-cell sliders)
     floatRoundness:   0,
     floatOpacity:     1.0,
     hybridMode:       false,
     appOpacity:       1.0,
     sidebarWidth:     null,
+    ctxMenuSections:  { startEnd: true, thumbnail: true, cellQueue: true },   // cell right-click menu sections
     borderSettings: {
         hue:       0,
         lightness: 50,
@@ -279,7 +289,54 @@ function deepMerge(defaults, saved) {
 const savedKeys = readJSON(FILES.shortcuts, {});
 window.keyMap = { ...DEFAULT_KEYS, ...savedKeys };
 
+// ONE KEY = ONE ACTION. The dispatcher only ever fires the FIRST action that owns a key, so a
+// saved file with duplicates is cleaned the same way: the first action keeps the key, the later
+// ones are cleared (and reported once at startup).
+window.dedupeKeyMap = km => {
+    const seen = new Set(), cleared = [];
+    for (const k of Object.keys(km)) {
+        const c = km[k];
+        if (!c) continue;
+        if (seen.has(c)) { km[k] = null; cleared.push(k); } else seen.add(c);
+    }
+    return cleared;
+};
+window.keyConflictsCleared = window.dedupeKeyMap(window.keyMap);
+
 window.savedLayouts = readJSON(FILES.layouts, []);
+
+// ── START / END POINTS ────────────────────────────────────────
+// { [fileId]: { name, path, time?: startSeconds, end?: endSeconds, savedAt } }
+// Written immediately on every change (tiny file) so nothing is lost on crash.
+window.startPoints = readJSON(FILES.startpoints, {});
+if (!window.startPoints || typeof window.startPoints !== 'object' || Array.isArray(window.startPoints)) {
+    window.startPoints = {};
+}
+const _isNum = v => typeof v === 'number' && isFinite(v);
+window.saveStartPoints  = () => { writeInternal(FILES.startpoints, window.startPoints); window.refreshStartMarkers?.(); };
+window.getStartPointId  = f  => f ? (f.path || `${f.name}_${f.size || 0}`) : null;
+window.getStartPoint    = f  => { const e = window.startPoints[window.getStartPointId(f)]; return (e && _isNum(e.time)) ? e.time : null; };
+window.getEndPoint      = f  => { const e = window.startPoints[window.getStartPointId(f)]; return (e && _isNum(e.end))  ? e.end  : null; };
+const _putPoint = (f, key, t) => {
+    const id = window.getStartPointId(f);
+    if (!id) return;
+    const e = window.startPoints[id] || {};
+    e.name = f.name; e.path = f.path || ''; e[key] = Math.round(t * 100) / 100; e.savedAt = Date.now();
+    window.startPoints[id] = e;
+    window.saveStartPoints();
+};
+const _dropPoint = (id, key) => {
+    const e = window.startPoints[id];
+    if (!e) return;
+    delete e[key];
+    if (!_isNum(e.time) && !_isNum(e.end)) delete window.startPoints[id];   // nothing left → drop the entry
+    window.saveStartPoints();
+};
+window.setStartPoint       = (f, t) => _putPoint(f, 'time', t);
+window.setEndPoint         = (f, t) => _putPoint(f, 'end',  t);
+window.clearStartPoint     = id => _dropPoint(id, 'time');
+window.clearEndPoint       = id => _dropPoint(id, 'end');
+window.clearAllStartPoints = ()  => { window.startPoints = {}; window.saveStartPoints(); };   // start AND end points
 
 const savedSettings = readJSON(FILES.settings, {});
 window.settings     = deepMerge(DEFAULT_SETTINGS, savedSettings);
@@ -324,12 +381,38 @@ window.addEventListener('beforeunload', () => {
         const file = window.playlist[window.currentTrack];
         writeInternal(FILES.state, { fileName: file.name });
     }
+
+    // ── Save recent queue for session restore ─────────────────
+    // Only serialise the fields needed to rebuild the file objects.
+    // We skip blob URLs, thumbnailUrl, etc. — they're transient.
+    if (window.playlist.length > 0) {
+        const serializable = window.playlist
+            .filter(f => f.path && !f.isWeb)   // local files only
+            .map(f => ({
+                name: f.name,
+                path: f.path,
+                size: f.size  || 0,
+                type: f.type  || ''
+            }));
+        if (serializable.length > 0) {
+            writeInternal(FILES.queue, {
+                savedAt:      Date.now(),
+                currentTrack: window.currentTrack,
+                mode:         window.settings.mode,
+                files:        serializable
+            });
+        }
+    }
 });
 
 // Custom layout (layout editor)
 window.saveCustomLayout = data  => writeInternal(FILES.custom, data);
 window.getCustomLayout  = ()    => readJSON(FILES.custom, null);
 window.saveState        = ()    => {};   // no-op — state is saved in beforeunload
+
+// Recent queue restore — called by app-controller on play-shortcut when queue is empty
+window.loadRecentQueue  = ()    => readJSON(FILES.queue, null);
+window.clearRecentQueue = ()    => writeInternal(FILES.queue, null);
 
 // ── BACKGROUND THEMES ─────────────────────────────────────────
 const BG_THEMES = [
