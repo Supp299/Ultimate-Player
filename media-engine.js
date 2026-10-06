@@ -13,6 +13,12 @@
 //  · getVirtualContentDimensions: safe division guards.
 //  · validateMediaRatio: no reentrant mountMediaInCell calls
 //    inside loadedmetadata callbacks.
+//  · FIX 11: _filterUnseenUnique — sequential mode now excludes
+//    files already active in other cells (previously only shuffle
+//    mode did), and both sequential + shuffle share one "seen this
+//    pass" history so the whole queue is shown once, top to bottom
+//    (or fully shuffled), before any file repeats. Fixes the same
+//    file appearing in multiple grid cells at once.
 // ============================================================
 
 'use strict';
@@ -213,9 +219,15 @@ function createTransformBar(cell) {
 
 // ── EFFECTS ───────────────────────────────────────────────────
 const EFFECT_LIST = ['fade','zoom-in','zoom-out','slide-up','slide-down','slide-left','slide-right',
-                     'spin','flip-x','flip-y','blur','elastic','flash','swing','glitch'];
+                     'spin','flip-x','flip-y','blur','elastic','flash','swing','glitch',
+                     'rise','diagonal','ripple','curtain','morph','bounce','vortex','shatter'];
 
-function getRandomEffect()   { return EFFECT_LIST[Math.floor(Math.random() * EFFECT_LIST.length)]; }
+// Separate list for video transitions (lighter, safer for video decoders)
+const VIDEO_EFFECT_LIST = ['fade-vid','zoom-in-vid','zoom-out-vid','slide-up-vid','slide-dn-vid',
+                            'slide-l-vid','slide-r-vid','blur-vid','morph-vid','curtain-vid'];
+
+function getRandomEffect() { return EFFECT_LIST[Math.floor(Math.random() * EFFECT_LIST.length)]; }
+function getRandomVideoEffect() { return VIDEO_EFFECT_LIST[Math.floor(Math.random() * VIDEO_EFFECT_LIST.length)]; }
 function getRandomDuration() {
     const min = (window.settings.minRandomDuration || 5)  * 1000;
     const max = (window.settings.maxRandomDuration || 30) * 1000;
@@ -262,7 +274,35 @@ function updateGridContents() {
         return;
     }
 
-    window.nextQueueIndex = window.currentTrack;
+    // FIX 1: Assign each cell its own sequential cursor (_seqIdx) starting
+    // from currentTrack + cellIndex so cells don't share a single pointer.
+    // This prevents cells from duplicating or skipping files when individual
+    // timers fire asynchronously.  The legacy window.nextQueueIndex is kept
+    // in sync for any external code that still reads it.
+    const n        = window.playlist.length;
+    const baseIdx  = ((window.currentTrack % n) + n) % n;
+    let   slotOffset = 0;
+
+    window.gridCellsRef.forEach((cell, i) => {
+        if (cell.dataset.locked !== 'true') {
+            // Each non-locked cell starts at a unique offset so they display
+            // different files even before any timer fires.
+            cell._seqIdx = (baseIdx + slotOffset) % n;
+            slotOffset++;
+        }
+    });
+
+    // Keep the shared pointer consistent for mix-ratio cursors and
+    // any callers that reference window.nextQueueIndex directly.
+    window.nextQueueIndex = (baseIdx + slotOffset) % n;
+
+    // When mix ratio is active, seed independent per-type cursors so that
+    // image-phase cells and video-phase cells each walk their own slice of
+    // the queue without the shared pointer skipping past what the other needs.
+    if (window.settings.advanceRatioMode && window.settings.customMixRatio) {
+        _seedMixTypePointers(window.currentTrack);
+    }
+
     window.gridCellsRef.forEach(cell => {
         if (cell.dataset.locked === 'true') return;
         mountMediaInCell(cell, -1, false);
@@ -307,6 +347,7 @@ window.aggressivelyCleanOldMedia = function(cell) {
         // 1. Stop playback before clearing src (avoids audio pops)
         if (el.tagName === 'VIDEO') {
             el.pause();
+            window.disposeMediaBoost?.(el);          // free Web Audio nodes (volume boost)
             el.removeAttribute('src');
             // Do NOT call el.load() — it re-initialises the HW decoder
             // and can crash other concurrently-decoding videos.
@@ -398,7 +439,7 @@ function mountMediaInCell(cell, preferredIndex, isForced = false) {
         else if (!isForced) pIdx = (pIdx + 1) % cell.privateQueue.length;
         cell.dataset.privateIndex = pIdx;
         fileToLoad  = cell.privateQueue[pIdx];
-        finalIndex  = 888888;      // sentinel: private queue item
+        finalIndex  = -2;      // sentinel: private queue item (safe, never a real index)
     } else if (window.playlist.length > 0) {
         const reqType  = cell.dataset.contentType || 'all';
         const reqRatio = cell.dataset.aspectRatio || 'all';
@@ -408,22 +449,56 @@ function mountMediaInCell(cell, preferredIndex, isForced = false) {
             if (rect.width && rect.height) autoTarget = rect.width / rect.height;
         }
 
+        // ── MIX RATIO: override effective type for 'all' cells ──────
+        // When advanceRatioMode is on and the cell accepts all content,
+        // cycle through N images then M videos as set by customMixRatio.
+        let effectiveType = reqType;
+        if (
+            !isForced &&
+            window.settings.advanceRatioMode &&
+            reqType === 'all' &&
+            window.settings.customMixRatio
+        ) {
+            effectiveType = _getMixRatioType(cell);
+        }
+
         if (isForced && preferredIndex >= 0) {
             finalIndex = preferredIndex;
             cell.dataset.forcedContent = 'true';
         } else if (window.settings.shuffle) {
-            finalIndex = _pickShuffleIndex(cell, reqType, reqRatio, autoTarget);
+            finalIndex = _pickShuffleIndex(cell, effectiveType, reqRatio, autoTarget);
         } else {
-            finalIndex = _pickSequentialIndex(cell, reqType, reqRatio, autoTarget);
+            finalIndex = _pickSequentialIndex(cell, effectiveType, reqRatio, autoTarget);
         }
+
+        // ── Mix-ratio fallback ────────────────────────────────────
+        // If the requested type (e.g. 'image') produced no result because
+        // the queue contains only the other type, retry with whatever is
+        // available.  This also covers the single-type queue case:
+        // all-images or all-videos queue still plays normally.
+        if (finalIndex === -1 && effectiveType !== reqType) {
+            // effectiveType was overridden by mix ratio — try any type
+            if (window.settings.shuffle) {
+                finalIndex = _pickShuffleIndex(cell, 'all', reqRatio, autoTarget);
+            } else {
+                finalIndex = _pickSequentialIndex(cell, 'all', reqRatio, autoTarget);
+            }
+        }
+
         if (finalIndex !== -1) fileToLoad = window.playlist[finalIndex];
     }
 
     // ── Retire current media ──────────────────────────────────
+    const _retireVideoEffect = window.settings.videoEffect && window.settings.videoEffect !== 'none' || window.settings.randomVideoEffect;
     cell.querySelectorAll('.media-active').forEach(el => {
         el.classList.remove('media-active');
         el.classList.add('media-old');
         el.style.pointerEvents = 'none';
+        // Tag retiring video so the CSS can fade it out visibly
+        // instead of snapping to display:none during the transition
+        if (el.tagName === 'VIDEO' && _retireVideoEffect) {
+            el.classList.add('video-fx-enabled');
+        }
     });
 
     // Clear timers and overlay UI
@@ -462,21 +537,173 @@ function mountMediaInCell(cell, preferredIndex, isForced = false) {
     renderMediaContent(cell, finalIndex, fileToLoad);
 }
 
-function _pickShuffleIndex(cell, reqType, reqRatio, autoTarget) {
-    const activeSet = getActiveIndices();
-    if (cell.dataset.currentIndex) activeSet.delete(parseInt(cell.dataset.currentIndex));
+// ── MIX RATIO PHASE TRACKER ─────────────────────────────────
+// Returns 'image' or 'video' for the next slot in this cell.
+//
+// Cycle mode  (random=false): strict sequence — play imgCount images,
+//   then vidCount videos, repeat.  Counters live on the cell node.
+//
+// Random mode (random=true):  each call independently picks a type
+//   with weighted probability: P(image) = images / (images + videos).
+//   The number spinners still matter — they set the weight, not a count.
+//
+// State is stored on the DOM node so it resets automatically when the
+// grid is rebuilt, or when setMixRatio() is called by the user.
+function _getMixRatioType(cell) {
+    const mix = window.settings.customMixRatio || { images: 1, videos: 1, random: false };
+    const imgCount = Math.max(1, mix.images);
+    const vidCount = Math.max(1, mix.videos);
 
-    let pool = _buildCandidatePool(reqType, reqRatio, autoTarget, cell);
-    if (pool.length === 0 && window.settings.autoFallback)
-        pool = window.playlist.map((_, i) => i)
-                              .filter(i => reqType === 'all' || getFileType(window.playlist[i]) === reqType);
+    // ── Random mode: weighted coin flip ──────────────────────
+    if (mix.random) {
+        return Math.random() < imgCount / (imgCount + vidCount) ? 'image' : 'video';
+    }
+
+    // ── Cycle mode: strict counter ────────────────────────────
+    // Initialise counters on first call for this cell
+    if (cell._mixPhase === undefined) {
+        cell._mixPhase    = 'image';  // start with images
+        cell._mixImgCount = 0;
+        cell._mixVidCount = 0;
+    }
+
+    const phase = cell._mixPhase;
+
+    if (phase === 'image') {
+        cell._mixImgCount++;
+        if (cell._mixImgCount >= imgCount) {
+            cell._mixPhase    = 'video';
+            cell._mixImgCount = 0;
+        }
+        return 'image';
+    } else {
+        cell._mixVidCount++;
+        if (cell._mixVidCount >= vidCount) {
+            cell._mixPhase    = 'image';
+            cell._mixVidCount = 0;
+        }
+        return 'video';
+    }
+}
+
+// Reset mix-ratio phase on ALL grid cells.
+// Called by playNext / playPrev / loadAndPlay so each manual navigation
+// batch starts a fresh cycle from image-phase again.
+function _resetAllMixPhases() {
+    document.querySelectorAll('.grid-cell').forEach(c => {
+        delete c._mixPhase;
+        delete c._mixImgCount;
+        delete c._mixVidCount;
+    });
+    // Also reset the per-type sequential cursors
+    window._mixImgQueueIdx = undefined;
+    window._mixVidQueueIdx = undefined;
+}
+
+// Seed two independent queue cursors — one walking images only,
+// one walking videos only — both starting from `startIdx`.
+// This prevents the shared nextQueueIndex from skipping past
+// files that the other type's cells still need.
+function _seedMixTypePointers(startIdx) {
+    const n = window.playlist.length;
+    if (!n) return;
+    const base = ((startIdx % n) + n) % n;
+
+    // Find the first image at or after base
+    let imgPtr = -1;
+    for (let i = 0; i < n; i++) {
+        const idx = (base + i) % n;
+        if (getFileType(window.playlist[idx]) === 'image') { imgPtr = idx; break; }
+    }
+    window._mixImgQueueIdx = imgPtr;
+
+    // Find the first video at or after base
+    let vidPtr = -1;
+    for (let i = 0; i < n; i++) {
+        const idx = (base + i) % n;
+        if (getFileType(window.playlist[idx]) === 'video') { vidPtr = idx; break; }
+    }
+    window._mixVidQueueIdx = vidPtr;
+}
+
+// FIX 11: Shared "show every file once before any repeat" filter, used
+// by BOTH the shuffle picker and the sequential picker below.
+//
+// Previously window.shuffleCycleHistory only guarded shuffle mode, and
+// the sequential picker never checked getActiveIndices() at all — it
+// just walked forward from its own per-cell cursor. Two things could
+// then put the same file in more than one cell at once:
+//   1. Sequential mode never excluded files already active in other
+//      cells, so a cell's cursor could simply land on an index another
+//      cell was already showing.
+//   2. Per-cell cursors drift apart whenever the playlist is shorter
+//      than the number of unlocked cells, a cell has its own type/ratio
+//      filter, mix-ratio is on, or the playlist mutates mid-session —
+//      after enough auto-advances, two cells' cursors can land on the
+//      same index even though each one individually never repeats.
+//
+// _filterUnseenUnique() fixes both: it drops anything currently active
+// in another cell, then drops anything already shown during the current
+// top-to-bottom pass (tracked in the shared history Set). Once nothing
+// remains that is both unique AND unseen, the history is cleared — that
+// is precisely "a new pass may begin" — and the file is chosen from the
+// full remaining pool again. This applies equally whether shuffle is on
+// or off; only how a candidate is picked FROM the filtered set differs
+// (random for shuffle, nearest-in-order for sequential).
+function _filterUnseenUnique(pool, cell) {
+    if (pool.length === 0) return pool;
+
+    const activeSet = getActiveIndices();
+    // FIX 3: Exclude the private-queue sentinel (-2) and guard against
+    // any stale negative values so they never pollute the candidate filter.
+    // Also don't let a cell's own current file block it from being picked
+    // again — that only matters when NO other candidate is left anyway.
+    const curIdx = parseInt(cell.dataset.currentIndex);
+    if (!isNaN(curIdx) && curIdx >= 0) activeSet.delete(curIdx);
 
     let available = pool.filter(i => !activeSet.has(i));
     if (available.length === 0) available = pool;
-    if (available.length === 0) return -1;
 
     let fresh = available.filter(i => !window.shuffleCycleHistory.has(i));
-    if (fresh.length === 0) { window.shuffleCycleHistory.clear(); fresh = available; }
+    if (fresh.length === 0) {
+        // Every remaining candidate has already been shown this pass —
+        // the whole queue has been displayed top-to-bottom (or fully
+        // shuffled through) at least once. Start a fresh pass.
+        window.shuffleCycleHistory.clear();
+        fresh = available;
+    }
+    return fresh;
+}
+
+// Smallest candidate at or after startIdx, wrapping to the smallest
+// candidate overall if none qualify. `sortedCandidates` is always
+// ascending because it's built by _buildCandidatePool() / a plain
+// index map, both of which iterate window.playlist in order.
+function _nextInOrder(sortedCandidates, startIdx) {
+    for (let i = 0; i < sortedCandidates.length; i++) {
+        if (sortedCandidates[i] >= startIdx) return sortedCandidates[i];
+    }
+    return sortedCandidates[0];
+}
+
+function _resolveCandidatePool(reqType, reqRatio, autoTarget, cell) {
+    let pool = _buildCandidatePool(reqType, reqRatio, autoTarget, cell);
+    // autoFallback: if ratio filter wiped the pool, ignore ratio but keep type
+    if (pool.length === 0 && window.settings.autoFallback)
+        pool = window.playlist.map((_, i) => i)
+                              .filter(i => reqType === 'all' || getFileType(window.playlist[i]) === reqType);
+    // If still empty (that type simply doesn't exist), allow any type
+    if (pool.length === 0 && reqType !== 'all')
+        pool = window.playlist.map((_, i) => i);
+    return pool;
+}
+
+function _pickShuffleIndex(cell, reqType, reqRatio, autoTarget) {
+    const pool = _resolveCandidatePool(reqType, reqRatio, autoTarget, cell);
+    if (pool.length === 0) return -1;
+
+    const fresh = _filterUnseenUnique(pool, cell);
+    if (fresh.length === 0) return -1;
 
     const idx = fresh[Math.floor(Math.random() * fresh.length)];
     window.shuffleCycleHistory.add(idx);
@@ -484,17 +711,76 @@ function _pickShuffleIndex(cell, reqType, reqRatio, autoTarget) {
 }
 
 function _pickSequentialIndex(cell, reqType, reqRatio, autoTarget) {
-    let searchIdx = (window.nextQueueIndex || 0) % window.playlist.length;
-    for (let attempts = 0; attempts < window.playlist.length; attempts++) {
-        const file = window.playlist[searchIdx];
-        if ((reqType === 'all' || getFileType(file) === reqType) &&
-            _ratioOk(file, reqRatio, autoTarget, cell)) {
-            window.nextQueueIndex = (searchIdx + 1) % window.playlist.length;
-            return searchIdx;
+    const n = window.playlist.length;
+
+    // ── Mix-ratio path: use independent per-type cursors ─────────
+    // When mix ratio is driving a specific type ('image' or 'video'),
+    // use the dedicated cursor for that type so the two types walk
+    // the queue independently and neither skips past the other's files.
+    if (
+        window.settings.advanceRatioMode &&
+        window.settings.customMixRatio &&
+        (reqType === 'image' || reqType === 'video')
+    ) {
+        const ptrKey = reqType === 'image' ? '_mixImgQueueIdx' : '_mixVidQueueIdx';
+
+        // If pointers were never seeded (e.g. live-load path), seed now
+        if (window[ptrKey] === undefined) _seedMixTypePointers(window.currentTrack);
+
+        let ptr = window[ptrKey];
+        if (ptr === -1) {
+            // No files of this type exist — fall through to standard path with 'all'
+            // (the mountMediaInCell fallback layer also catches this, but
+            //  short-circuiting here avoids a redundant scan)
+            return _pickSequentialIndex(cell, 'all', reqRatio, autoTarget);
         }
-        searchIdx = (searchIdx + 1) % window.playlist.length;
+
+        // FIX 11: respect the same "not active elsewhere / not already
+        // shown this pass" rules as the standard path, instead of just
+        // walking forward and taking the first type/ratio match.
+        const pool = _buildCandidatePool(reqType, reqRatio, autoTarget, cell);
+        if (pool.length === 0) return -1;
+
+        const fresh = _filterUnseenUnique(pool, cell);
+        if (fresh.length === 0) return -1;
+
+        const idx = _nextInOrder(fresh, ptr);
+        window.shuffleCycleHistory.add(idx);
+
+        // Advance this type's cursor to the next file of the same type
+        let next = (idx + 1) % n;
+        for (let j = 1; j < n; j++) {
+            if (getFileType(window.playlist[next]) === reqType) break;
+            next = (next + 1) % n;
+        }
+        window[ptrKey] = next;
+        return idx;
     }
-    return -1;
+
+    // ── Standard path: shared "show every file once per pass" queue ──
+    // FIX 1 originally gave each cell its own cursor (cell._seqIdx) so
+    // cells wouldn't fight over one shared pointer. FIX 11 keeps that
+    // per-cell cursor (it still decides WHERE in the order each cell is
+    // looking) but the actual candidate is now filtered through
+    // _filterUnseenUnique() first, so a cell can never land on a file
+    // that's already showing in another cell, and the picker always
+    // works its way through the full remaining queue before anything
+    // repeats — matching sequential mode's "top to bottom, once" order.
+    const pool = _resolveCandidatePool(reqType, reqRatio, autoTarget, cell);
+    if (pool.length === 0) return -1;
+
+    const fresh = _filterUnseenUnique(pool, cell);
+    if (fresh.length === 0) return -1;
+
+    const startIdx = ((cell._seqIdx !== undefined ? cell._seqIdx : (window.nextQueueIndex || 0)) % n + n) % n;
+    const idx = _nextInOrder(fresh, startIdx);
+
+    // Advance this cell's own cursor for its next auto-advance.
+    cell._seqIdx = (idx + 1) % n;
+    // Also advance the shared pointer so external code stays consistent.
+    window.nextQueueIndex = cell._seqIdx;
+    window.shuffleCycleHistory.add(idx);
+    return idx;
 }
 
 function _buildCandidatePool(reqType, reqRatio, autoTarget, cell) {
@@ -603,6 +889,10 @@ function renderMediaContent(cell, finalIndex, fileOverride = null) {
     let effect = window.settings.effect || 'none';
     if (window.settings.randomEffect) effect = getRandomEffect();
 
+    // Separate video effect setting (Feature 4)
+    let videoEffect = window.settings.videoEffect || 'none';
+    if (window.settings.randomVideoEffect) videoEffect = getRandomVideoEffect();
+
     const rect    = cell.getBoundingClientRect();
     const targetW = Math.floor(rect.width)  || 300;
     const targetH = Math.floor(rect.height) || 150;
@@ -627,7 +917,14 @@ function renderMediaContent(cell, finalIndex, fileOverride = null) {
 
     // ── Activate the new element ──────────────────────────────
     visEl.style.objectFit = fitMode;
-    if (!isVideo) visEl.classList.add(`fx-${effect}`);
+    if (isVideo) {
+        // Feature 4: Video can now have its own transition effect
+        if (videoEffect && videoEffect !== 'none') {
+            visEl.classList.add('video-fx-enabled', `fx-${videoEffect}`);
+        }
+    } else {
+        visEl.classList.add(`fx-${effect}`);
+    }
     cell.appendChild(visEl);
     void visEl.offsetWidth;     // force reflow so CSS transition fires
 
@@ -636,8 +933,13 @@ function renderMediaContent(cell, finalIndex, fileOverride = null) {
             visEl.classList.add('media-active');
             applyTransform(cell);
 
-            // Clean up old media after the transition finishes
             const fxMs = (parseFloat(window.settings.effectSpeed) || 0.8) * 1000;
+            const hasVideoFx = videoEffect && videoEffect !== 'none';
+
+            // For video effects, delay cleanup until the old video's CSS
+            // fade-out transition also finishes (it runs in parallel with
+            // the new video's entry). Add 150ms buffer for slow GPUs.
+            const cleanupDelay = hasVideoFx ? fxMs + 150 : fxMs + 50;
             setTimeout(() => {
                 window.aggressivelyCleanOldMedia(cell);
 
@@ -645,7 +947,7 @@ function renderMediaContent(cell, finalIndex, fileOverride = null) {
                     ['tfRot','tfSx','tfSy','tfSh','tfSv','tfX','tfY','tfZoom']
                         .forEach(k => delete cell.dataset[k]);
                 }
-            }, fxMs + 50);
+            }, cleanupDelay);
         });
     });
 }
@@ -659,11 +961,13 @@ function _buildVideoElement(cell, file, url, isBlob, targetW, targetH, finalInde
     vid.autoplay     = true;
     vid.playsInline  = true;
     if (isBlob) vid.dataset.blobUrl = url;
+    vid.dataset.spId = window.getStartPointId?.(file) || '';   // links this <video> to its start point
+    vid._spFile      = file;                                    // the exact file shown (also for cell-queue videos)
 
     const isLocked  = cell.dataset.audioLocked === 'true';
     vid.muted        = isLocked ? false : (window.isGlobalMuted ?? true);
-    vid.volume       = cell.dataset.savedVolume !== undefined
-        ? parseFloat(cell.dataset.savedVolume) : (window.settings.globalVolume ?? 1);
+    setMediaVolume(vid, cell.dataset.savedVolume !== undefined
+        ? parseFloat(cell.dataset.savedVolume) : (window.settings.globalVolume ?? 1));
 
     const targetSpeed = cell.dataset.savedSpeed !== undefined
         ? parseFloat(cell.dataset.savedSpeed)
@@ -672,7 +976,11 @@ function _buildVideoElement(cell, file, url, isBlob, targetW, targetH, finalInde
 
     vid.addEventListener('loadedmetadata', () => {
         if (cell.dataset.savedSpeed  !== undefined) vid.playbackRate = parseFloat(cell.dataset.savedSpeed);
-        if (cell.dataset.savedVolume !== undefined) vid.volume       = parseFloat(cell.dataset.savedVolume);
+        if (cell.dataset.savedVolume !== undefined) setMediaVolume(vid, parseFloat(cell.dataset.savedVolume));
+        // Saved start point: jump there when this video is loaded into a cell
+        const _sp = window.getStartPoint?.(file);
+        if (_sp != null && vid.duration && _sp < vid.duration - 1) { try { vid.currentTime = _sp; } catch {} }
+        window.updateStartMarker?.(vid);
         validateMediaRatio(cell, vid.videoWidth, vid.videoHeight, finalIndex);
     });
 
@@ -693,6 +1001,16 @@ function _buildVideoElement(cell, file, url, isBlob, targetW, targetH, finalInde
 
     if (window.isPaused) vid.pause();
     else vid.play().catch(() => {});
+
+    // End point: when playback reaches it, behave as if the video finished
+    vid.addEventListener('timeupdate', () => {
+        const ep = window.getEndPoint?.(file);
+        if (ep == null || !vid.duration || ep >= vid.duration || cell.dataset.abB) return;   // A/B loop has priority
+        if (vid._spSkipEnd) { if (vid.currentTime < ep - 0.3) vid._spSkipEnd = false; return; } // just set → plays through this time
+        if (vid.currentTime < ep) return;
+        if (vid.loop) { const st = window.getStartPoint?.(file); vid.currentTime = st != null ? st : 0; }
+        else if (!vid._spEnded) { vid._spEnded = true; loadNextIntoCell(cell); }
+    });
 
     // Audio lock button
     const audioBtn = document.createElement('div');
@@ -734,11 +1052,16 @@ function _buildVideoControls(cell, vid, initialSpeed) {
 
     const playBtn = document.createElement('button');
     playBtn.className = 'cell-btn';
-    playBtn.innerHTML = GRID_ICONS.pause;
+    // Icon always mirrors the real <video> state, so it stays correct when the
+    // cell is toggled by double-click or by the global play/pause button.
+    const syncPlayIcon = () => { playBtn.innerHTML = vid.paused ? GRID_ICONS.play : GRID_ICONS.pause; };
+    syncPlayIcon();
+    vid.addEventListener('play',  syncPlayIcon);
+    vid.addEventListener('pause', syncPlayIcon);
     playBtn.onclick   = e => {
         e.stopPropagation();
-        if (vid.paused) { vid.play(); playBtn.innerHTML = GRID_ICONS.pause; }
-        else            { vid.pause(); playBtn.innerHTML = GRID_ICONS.play; }
+        if (vid.paused) vid.play().catch(() => {});
+        else            vid.pause();
     };
     btnGroup.appendChild(repeatBtn);
     btnGroup.appendChild(playBtn);
@@ -779,6 +1102,12 @@ function _buildVideoControls(cell, vid, initialSpeed) {
     timeline.appendChild(timeRange);
     timeline.appendChild(markerA);
     timeline.appendChild(markerB);
+    const markerS = document.createElement('div'); markerS.className = 'marker-s';
+    timeline.appendChild(markerS);
+    vid._spMarker = markerS;
+    const markerE = document.createElement('div'); markerE.className = 'marker-e';
+    timeline.appendChild(markerE);
+    vid._epMarker = markerE;
     controls.appendChild(timeline);
 
     // ── Right column: speed + volume ─────────────────────────
@@ -825,22 +1154,76 @@ function _buildVideoControls(cell, vid, initialSpeed) {
 
     const volRange  = document.createElement('input');
     volRange.type   = 'range'; volRange.className = 'cell-vol-slider';
-    volRange.min    = 0; volRange.max = 1; volRange.step = 0.05; volRange.value = vid.volume;
+    setVolumeSlider(volRange, getMediaVolume(vid));          // 0–100% normally, 0–1000% with Volume Boost
+    volRange.title = Math.round(getMediaVolume(vid) * 100) + '%';
 
     const saveVolBtn = document.createElement('button');
     saveVolBtn.className = 'cell-save-btn'; saveVolBtn.innerHTML = GRID_ICONS.save;
     if (cell.dataset.savedVolume) saveVolBtn.classList.add('active');
 
+    // ── Live value bubble: shown above the thumb while the slider is grabbed ──
+    const THUMB_PX  = 10;                                   // matches .cell-vol-slider thumb width
+    const volBubble = document.createElement('div');
+    volBubble.className = 'cell-vol-bubble';
+    volRow.classList.add('cell-vol-row');                   // positioning context for the bubble
+    let bubbleDragging = false, bubbleTimer = null;
+
+    const placeVolBubble = () => {
+        const sr = volRange.getBoundingClientRect();
+        const rr = volRow.getBoundingClientRect();
+        const cr = cell.getBoundingClientRect();
+        const span  = (Number(volRange.max) - Number(volRange.min)) || 1;
+        const ratio = (Number(volRange.value) - Number(volRange.min)) / span;
+        // The thumb only travels inside the slider's padding + border box (a global
+        // `input[type=range]` rule adds 8px padding + 1px border), so measure that.
+        const cs     = getComputedStyle(volRange);
+        const insetL = (parseFloat(cs.paddingLeft)  || 0) + (parseFloat(cs.borderLeftWidth)  || 0);
+        const insetR = (parseFloat(cs.paddingRight) || 0) + (parseFloat(cs.borderRightWidth) || 0);
+        const trackW = sr.width - insetL - insetR;
+        const thumbX = sr.left + insetL + THUMB_PX / 2 + ratio * (trackW - THUMB_PX);   // thumb centre (viewport px)
+        const half   = volBubble.offsetWidth / 2;
+        // keep the bubble inside the cell (cells clip overflow); the arrow keeps pointing at the thumb
+        const cx = Math.min(Math.max(thumbX, cr.left + half + 4), cr.right - half - 4);
+        volBubble.style.left = (cx - rr.left) + 'px';
+        volBubble.style.setProperty('--arrow-dx', (thumbX - cx) + 'px');
+    };
+    const hideVolBubble = () => { clearTimeout(bubbleTimer); volBubble.classList.remove('show'); };
+    const showVolBubble = () => {
+        const v = readVolumeSlider(volRange);
+        volBubble.textContent = Math.round(v * 100) + '%';
+        volBubble.classList.toggle('boost', v > 1);         // amber above 100%
+        volBubble.classList.toggle('max',   v >= 4);        // red from 400% (likely to distort)
+        placeVolBubble();
+        volBubble.classList.add('show');
+        clearTimeout(bubbleTimer);
+        if (!bubbleDragging) bubbleTimer = setTimeout(hideVolBubble, 900);   // keyboard / click: auto-hide
+    };
+    const endVolDrag = () => {
+        bubbleDragging = false;
+        clearTimeout(bubbleTimer);
+        bubbleTimer = setTimeout(hideVolBubble, 700);       // linger so the final value can be read
+    };
+    volRange.addEventListener('pointerdown', () => {
+        bubbleDragging = true;
+        showVolBubble();
+        window.addEventListener('pointerup',     endVolDrag, { once: true });
+        window.addEventListener('pointercancel', endVolDrag, { once: true });
+    });
+    volRange.addEventListener('blur', hideVolBubble);
+
     const updateVolIcon = () => {
-        volBtn.innerHTML = (vid.muted || vid.volume === 0) ? GRID_ICONS.mute :
-                           (vid.volume < 0.5 ? GRID_ICONS.soundLow : GRID_ICONS.sound);
+        const lv = getMediaVolume(vid);
+        volBtn.innerHTML = (vid.muted || lv === 0) ? GRID_ICONS.mute :
+                           (lv < 0.5 ? GRID_ICONS.soundLow : GRID_ICONS.sound);
     };
     volRange.oninput = e => {
         e.stopPropagation();
-        const val = parseFloat(e.target.value);
-        vid.volume = val;
+        const val = readVolumeSlider(e.target);
+        setMediaVolume(vid, val);
+        volRange.title = Math.round(val * 100) + '%';
         if (val > 0 && vid.muted) vid.muted = false;
         updateVolIcon();
+        showVolBubble();
         if (saveVolBtn.classList.contains('active')) cell.dataset.savedVolume = val;
     };
     saveVolBtn.onclick = e => {
@@ -848,14 +1231,14 @@ function _buildVideoControls(cell, vid, initialSpeed) {
         if (saveVolBtn.classList.contains('active')) {
             delete cell.dataset.savedVolume;
             saveVolBtn.classList.remove('active');
-            const g = parseFloat(document.getElementById('globalVolSlider')?.value || 1);
-            vid.volume = g; volRange.value = g; updateVolIcon();
+            const g = clampVolume(window.settings.globalVolume ?? 1);
+            setMediaVolume(vid, g); setVolumeSlider(volRange, g); volRange.title = Math.round(g * 100) + '%'; updateVolIcon();
         } else {
-            cell.dataset.savedVolume = vid.volume;
+            cell.dataset.savedVolume = getMediaVolume(vid);
             saveVolBtn.classList.add('active');
         }
     };
-    volRow.appendChild(volBtn); volRow.appendChild(volRange); volRow.appendChild(saveVolBtn);
+    volRow.appendChild(volBtn); volRow.appendChild(volRange); volRow.appendChild(saveVolBtn); volRow.appendChild(volBubble);
 
     stack.appendChild(speedRow);
     stack.appendChild(volRow);
@@ -1038,7 +1421,11 @@ function _buildNavBtn(cell, direction, finalIndex) {
             const rect = cell.getBoundingClientRect();
             if (rect.width && rect.height) autoTarget = rect.width / rect.height;
         }
-        let idx   = finalIndex;
+        // FIX 4: Read the live index from dataset at click time — not from
+        // the stale closure variable `finalIndex` which may be -2 (sentinel)
+        // or a position that has already advanced since the button was built.
+        const liveIdx = parseInt(cell.dataset.currentIndex);
+        let idx   = (!isNaN(liveIdx) && liveIdx >= 0) ? liveIdx : (finalIndex >= 0 ? finalIndex : 0);
         let found = false;
         for (let k = 0; k < len; k++) {
             idx = direction === 'left'
@@ -1074,6 +1461,9 @@ function loadAndPlay(index) {
     if (index >= window.playlist.length) index = 0;
     window.currentTrack = index;
     clearAllTimers();
+    // FIX 9: When starting from index 0 (fresh load or clear+reload), wipe
+    // the shuffle cycle history so old indices don't bleed into the new playlist.
+    if (index === 0) window.shuffleCycleHistory?.clear();
     if (typeof saveState   === 'function') saveState();
     if (typeof renderPlaylist === 'function') renderPlaylist();
 
@@ -1098,6 +1488,8 @@ function loadAndPlay(index) {
         els.img.style.display   = 'none';
         els.grid.style.display  = 'block';
         if (!els.grid.innerHTML.trim()) window.initGrid?.();
+        // Reset mix-ratio phases on explicit track jumps (queue click, auto-advance)
+        if (window.settings.advanceRatioMode) _resetAllMixPhases();
         if (window.playlist.length > 0) updateGridContents();
     }
 }
@@ -1111,7 +1503,12 @@ function playNext() {
     if (window.settings.mode === 'video') {
         loadAndPlay(window.currentTrack + 1);
     } else {
+        // FIX 5: Kill all pending timers BEFORE updating cells so stale
+        // image timers cannot fire a second advance on top of this one.
+        clearAllTimers();
         window.currentTrack = (window.currentTrack + getGridCapacity()) % window.playlist.length;
+        // Reset mix-ratio phase so the new batch starts a fresh cycle
+        if (window.settings.advanceRatioMode) _resetAllMixPhases();
         updateGridContents();
     }
 }
@@ -1121,8 +1518,12 @@ function playPrev() {
     if (window.settings.mode === 'video') {
         loadAndPlay(window.currentTrack <= 0 ? window.playlist.length - 1 : window.currentTrack - 1);
     } else {
+        // FIX 5: Same as playNext — clear before updating.
+        clearAllTimers();
         const step = getGridCapacity();
         window.currentTrack = (window.currentTrack - step + window.playlist.length) % window.playlist.length;
+        // Reset mix-ratio phase so the new batch starts a fresh cycle
+        if (window.settings.advanceRatioMode) _resetAllMixPhases();
         updateGridContents();
     }
 }
@@ -1177,6 +1578,29 @@ window.startCellCountdown = function(cell, duration) {
 
 window.stopCellCountdown = function(cell) {
     if (cell.dataset.cdInterval) { clearInterval(parseInt(cell.dataset.cdInterval)); delete cell.dataset.cdInterval; }
+};
+
+// ── START POINT MARKER (S) ────────────────────────────────────
+window.updateStartMarker = function(vid) {          // updates both the S and E markers
+    if (!vid) return;
+    const e   = window.startPoints?.[vid.dataset.spId];
+    const dur = vid.duration;
+    const ok  = dur && isFinite(dur);
+    const place = (m, v, label) => {
+        if (!m) return;
+        if (ok && typeof v === 'number' && isFinite(v) && v < dur) {
+            m.style.display = 'block';
+            m.style.left    = (v / dur * 100) + '%';
+            m.title         = label + ' ' + formatCellTime(v);
+        } else {
+            m.style.display = 'none';
+        }
+    };
+    place(vid._spMarker, e?.time, 'Start point');
+    place(vid._epMarker, e?.end,  'End point');
+};
+window.refreshStartMarkers = function() {
+    document.querySelectorAll('.grid-cell video').forEach(window.updateStartMarker);
 };
 
 // ── A/B REPEAT ────────────────────────────────────────────────
