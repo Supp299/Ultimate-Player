@@ -12,6 +12,15 @@
 //  · processFiles: async scan on folder import is non-blocking.
 //  · checkQueueState: no double loadAndPlay on currentTrack==0.
 //  · sidebarAutoHideTimer always cleared on mouseenter (no leak).
+//  · FIX 12: applyFullscreenUI — fullscreen UI state (is-fullscreen,
+//    minimal-ui, sidebar overlay/collapsed) is now applied directly
+//    and synchronously whenever fsBtn is used, instead of only via
+//    the 'fullscreenchange' DOM event. Electron's native window
+//    fullscreen (win.setFullScreen) never fires that event, so the
+//    sidebar never got its 'collapsed' class, #toggleSidebarBtn
+//    stayed force-hidden, and .ctrl-right kept reserving space for
+//    the (invisible) open sidebar — making fsBtn/toggleSidebarBtn
+//    drift away from the true right edge on entering fullscreen.
 // ============================================================
 
 'use strict';
@@ -114,10 +123,10 @@ function getEls() {
         effectSel: g('effectSelect'), durInput: g('slideTimeInput'),
         durVal: g('slideTimeVal'), shuffleBtn: g('shuffleBtn'),
         musicSec: g('musicSection'), bgAudio: g('bgAudio'),
-        musicName: g('musicName'), oledToggle: g('oledToggle'),
-        wakeLockToggle: g('wakeLockToggle'), dropOverlay: g('dropOverlay'),
-        keybindList: g('keybindList'), shortcutsFooter: g('shortcutsFooter'),
-        shortcutsToggle: g('shortcutsToggle'), queueInfoToggle: g('queueInfoToggle'),
+        musicName: g('musicName'), oledToggle: null,
+        wakeLockToggle: null, dropOverlay: g('dropOverlay'),
+        keybindList: g('keybindList'), shortcutsFooter: null,
+        shortcutsToggle: null, queueInfoToggle: g('queueInfoToggle'),
         thumbnailToggle: g('thumbnailToggle'), editorQueueInfo: g('editorQueueInfo'),
         autoFallbackToggle: g('autoFallbackToggle'), accentPicker: g('accentPicker'),
         bgPicker: g('bgPicker'), layoutName: g('layoutName'),
@@ -143,9 +152,12 @@ function getEls() {
         contrastInput: g('contrastInput'), satInput: g('satInput'),
         hueInput: g('hueInput'), invertInput: g('invertInput'),
         borderHueInput: g('borderHueInput'), borderAlphaInput: g('borderAlphaInput'),
+        videoEffectSel: g('videoEffectSelect'), randomVideoEffectToggle: g('randomVideoEffectToggle'),
+        clearThumbCacheBtn: g('clearThumbCacheBtn'),
         borderLightInput: g('borderLightInput'), borderAlphaVal: g('borderAlphaVal'),
         borderLightVal: g('borderLightVal'), whiteMixContainer: g('whiteMixContainer'),
         advanceRatioToggle: g('advanceRatioToggle'), hybridToggle: g('hybridToggle'),
+        volumeBoostToggle: g('volumeBoostToggle'),
         notifMaster: g('notifMaster'), notifMedia: g('notifMedia'),
         notifGrid: g('notifGrid'), notifQueue: g('notifQueue'),
         notifFile: g('notifFile'), notifLive: g('notifLive'), notifSystem: g('notifSystem'),
@@ -195,6 +207,11 @@ window.applySettingsToUI = function() {
 
     set(els.gridSel, s.gridSize);
     if (els.hybridToggle) els.hybridToggle.checked = !!s.hybridMode;
+    if (els.volumeBoostToggle) els.volumeBoostToggle.checked = !!s.volumeBoost;
+    { const cs = s.ctxMenuSections || {};
+      [['ctxSecStartEnd', 'startEnd'], ['ctxSecThumb', 'thumbnail'], ['ctxSecQueue', 'cellQueue']].forEach(([id, k]) => {
+          const el = document.getElementById(id); if (el) el.checked = cs[k] !== false;
+      }); }
     set(els.effectSel, s.effect);
     if (els.durInput) { set(els.durInput, s.duration / 1000); setText(els.durVal, s.duration / 1000); }
     if (els.gapSizeInput) {
@@ -234,6 +251,12 @@ window.applySettingsToUI = function() {
         els.randomEffectToggle.checked = !!s.randomEffect;
         if (els.effectSel) { els.effectSel.disabled = !!s.randomEffect; els.effectSel.style.opacity = s.randomEffect ? '0.5' : '1'; }
     }
+    // Feature 4: Video effect init
+    if (els.videoEffectSel) set(els.videoEffectSel, s.videoEffect || 'none');
+    if (els.randomVideoEffectToggle) {
+        els.randomVideoEffectToggle.checked = !!s.randomVideoEffect;
+        if (els.videoEffectSel) { els.videoEffectSel.disabled = !!s.randomVideoEffect; els.videoEffectSel.style.opacity = s.randomVideoEffect ? '0.5' : '1'; }
+    }
     if (els.advanceRatioToggle) els.advanceRatioToggle.checked = !!s.advanceRatioMode;
     if (els.countdownToggle)    els.countdownToggle.checked    = !!s.showCountdown;
 
@@ -244,8 +267,9 @@ window.applySettingsToUI = function() {
     if (window.updateBorderStyles) window.updateBorderStyles();
 
     if (els.globalVolSlider) {
-        set(els.globalVolSlider, s.globalVolume);
-        setText(els.globalVolDisplay, Math.round(s.globalVolume * 100) + '%');
+        const gv = clampVolume(s.globalVolume ?? 1);          // capped at 100% unless Volume Boost is on
+        setVolumeSlider(els.globalVolSlider, gv);
+        setText(els.globalVolDisplay, Math.round(gv * 100) + '%');
     }
 
     updateVisualFilters();
@@ -256,7 +280,6 @@ window.applySettingsToUI = function() {
     set(els.invertInput,   s.filters.invert);
     set(els.filterTarget,  s.filters.target);
 
-    if (els.wakeLockToggle)    els.wakeLockToggle.checked    = !!s.wakeLock;
     if (els.queueInfoToggle)   els.queueInfoToggle.checked   = !!s.showQueueInfo;
     if (els.thumbnailToggle)   els.thumbnailToggle.checked   = !!s.showThumbnails;
 
@@ -285,11 +308,6 @@ window.applySettingsToUI = function() {
     if (els.rotateFillToggle) els.rotateFillToggle.checked = !!s.rotateFill;
     if (els.editorQueueInfo)  els.editorQueueInfo.checked  = !!s.showQueueInfo;
     if (els.autoFallbackToggle) els.autoFallbackToggle.checked = !!s.autoFallback;
-    if (els.shortcutsToggle) {
-        els.shortcutsToggle.checked = !!s.showShortcuts;
-        const sf = document.getElementById('shortcutsFooter');
-        if (sf) sf.style.display = s.showShortcuts ? 'flex' : 'none';
-    }
     if (s.shuffle && els.shuffleBtn) els.shuffleBtn.classList.add('active');
 
     if (els.appOpacityInput) {
@@ -342,6 +360,47 @@ window.app = {
     handleBgImage:     (inp)  => handleBgImage(inp),
     setFullscreen:     (t)    => setFullscreen(t),
     exitApp:           ()     => exitApp(),
+
+    // ── Start points ──────────────────────────────────────────
+    ctxSetStartPoint: () => {
+        const f = window.ctxStartFile, t = window.ctxStartPointTime, v = window.lastRightClickedCell?.querySelector('video.media-active');
+        closeContextMenu(); setCellPoint('start', f, t, v);
+    },
+    ctxCancelStartPoint: () => { const f = window.ctxStartFile; closeContextMenu(); cancelCellPoint('start', f); },
+    ctxSetEndPoint: () => {
+        const f = window.ctxStartFile, t = window.ctxStartPointTime, v = window.lastRightClickedCell?.querySelector('video.media-active');
+        closeContextMenu(); setCellPoint('end', f, t, v);
+    },
+    ctxCancelEndPoint: () => { const f = window.ctxStartFile; closeContextMenu(); cancelCellPoint('end', f); },
+    setCtxSection: (key, on) => {          // Settings → Options → Right-Click Menu on Cell
+        window.settings.ctxMenuSections = { startEnd: true, thumbnail: true, cellQueue: true, ...(window.settings.ctxMenuSections || {}) };
+        window.settings.ctxMenuSections[key] = !!on;
+        window.saveConfig();
+    },
+    openStartPointsManager: () => {
+        renderStartPointList();
+        document.body.classList.add('settings-open');
+        document.getElementById('startPointsModal')?.classList.add('open');
+    },
+    closeStartPointsManager: () => {
+        document.getElementById('startPointsModal')?.classList.remove('open');
+        // Keep the grid locked if the Settings window is still open underneath
+        if (!document.getElementById('settingsModal')?.classList.contains('open'))
+            document.body.classList.remove('settings-open');
+    },
+    askClearAllStartPoints: () => {
+        const n = Object.keys(window.startPoints || {}).length;
+        if (!n) return;
+        const c = document.getElementById('spClearCount'); if (c) c.textContent = n;
+        document.getElementById('startPointsClearModal')?.classList.add('open');
+    },
+    closeClearStartPointsModal: () => document.getElementById('startPointsClearModal')?.classList.remove('open'),
+    confirmClearAllStartPoints: () => {
+        window.clearAllStartPoints();
+        renderStartPointList();
+        document.getElementById('startPointsClearModal')?.classList.remove('open');
+        showToast('All start points deleted', 'success', 'media');
+    },
     closeExitModal:    ()     => closeExitModal(),
     confirmExit:       ()     => confirmExit(),
     minimizeApp:       ()     => minimizeApp(),
@@ -436,11 +495,6 @@ window.app = {
             pushToCellQueue(window.lastRightClickedCell, all);
         }
     },
-    addFromMainToCell: () => {
-        if (!window.lastRightClickedCell) return;
-        if (!window.playlist.length) return showToast('Main queue is empty', 'warning', 'queue');
-        pushToCellQueue(window.lastRightClickedCell, [...window.playlist]);
-    },
     showCellQueue:  () => { if (window.lastRightClickedCell) renderCFQ(window.lastRightClickedCell); },
     clearCellQueue: () => {
         const cell = window.lastRightClickedCell;
@@ -481,6 +535,93 @@ window.app = {
         if (window.isElectron) require('electron').shell.showItemInFolder(file.path);
         closeContextMenu();
     },
+
+    // ── Grid cell right-click thumbnail capture (Feature 1) ───
+    ctxCaptureGridThumbnail: () => {
+        const cell = window.lastRightClickedCell;
+        const idx  = window.ctxTargetIndex;
+        closeContextMenu();
+        if (!cell || idx < 0) return;
+
+        const file = window.playlist[idx];
+        if (!file) return;
+
+        const vid = cell.querySelector('video.media-active');
+        if (!vid) { showToast('No active video frame found in cell', 'warning', 'media'); return; }
+
+        try {
+            const w = vid.videoWidth  || 320;
+            const h = vid.videoHeight || 180;
+            const thumbW = Math.round(100 * (w / h));
+            const canvas = new OffscreenCanvas(thumbW, 100);
+            const ctx    = canvas.getContext('2d');
+            ctx.drawImage(vid, 0, 0, thumbW, 100);
+
+            canvas.convertToBlob({ type: 'image/webp', quality: 0.85 }).then(async blob => {
+                canvas.width = 0; canvas.height = 0;
+                let thumbnailUrl = null;
+
+                if (window.isElectron) {
+                    try {
+                        const nodefs   = require('fs');
+                        const nodepath = require('path');
+                        const isPackaged = !process.defaultApp && !/node_modules/.test(process.execPath);
+                        const baseDir    = isPackaged ? nodepath.dirname(process.execPath) : __dirname;
+                        const thumbDir   = nodepath.join(baseDir, 'data', 'thumbnails');
+                        if (!nodefs.existsSync(thumbDir)) nodefs.mkdirSync(thumbDir, { recursive: true });
+                        function _ghStr(str) { let h=0; for(let i=0;i<str.length;i++){h=((h<<5)-h)+str.charCodeAt(i);h|=0;} return Math.abs(h).toString(36); }
+                        const fileId = file.path || (file.name + '_' + file.size);
+                        const fname  = file.name.replace(/[^a-z0-9]/gi,'_').substring(0,30) + '_' + _ghStr(fileId) + '.webp';
+                        const dest   = nodepath.join(thumbDir, fname);
+                        const tmp    = dest + '.tmp';
+                        nodefs.writeFileSync(tmp, Buffer.from(await blob.arrayBuffer()));
+                        nodefs.renameSync(tmp, dest);
+                        thumbnailUrl = 'file://' + dest.replace(/\\/g, '/') + '?t=' + Date.now();
+                    } catch { thumbnailUrl = URL.createObjectURL(blob); }
+                } else {
+                    thumbnailUrl = URL.createObjectURL(blob);
+                }
+
+                const fileId = file.path || (file.name + '_' + file.size);
+                if (window.thumbCache) window.thumbCache.set(fileId, thumbnailUrl);
+                file.thumbnailUrl = thumbnailUrl;
+                renderPlaylist();
+                // Briefly highlight the cell to confirm
+                cell.style.transition = 'box-shadow 0.2s';
+                cell.style.boxShadow  = 'inset 0 0 0 3px #22c55e';
+                setTimeout(() => { cell.style.boxShadow = ''; }, 800);
+                showToast('Thumbnail captured from grid frame ✓', 'success', 'media');
+            }).catch(() => showToast('Frame capture failed', 'error', 'media'));
+        } catch (e) {
+            console.error('[thumb] Grid capture failed:', e);
+            showToast('Failed to capture thumbnail', 'error', 'media');
+        }
+    },
+
+    ctxResetGridThumbnail: () => {
+        const idx = window.ctxTargetIndex;
+        closeContextMenu();
+        if (idx < 0) return;
+        const file = window.playlist[idx];
+        if (!file) return;
+        const fileId = file.path || (file.name + '_' + file.size);
+        if (window.thumbCache) window.thumbCache.delete(fileId);
+        file.thumbnailUrl = null;
+        if (window.isElectron) {
+            try {
+                const nodefs   = require('fs');
+                const nodepath = require('path');
+                const isPackaged = !process.defaultApp && !/node_modules/.test(process.execPath);
+                const baseDir    = isPackaged ? nodepath.dirname(process.execPath) : __dirname;
+                function _ghStr(str) { let h=0; for(let i=0;i<str.length;i++){h=((h<<5)-h)+str.charCodeAt(i);h|=0;} return Math.abs(h).toString(36); }
+                const fname = file.name.replace(/[^a-z0-9]/gi,'_').substring(0,30) + '_' + _ghStr(fileId) + '.webp';
+                const dest  = nodepath.join(baseDir, 'data', 'thumbnails', fname);
+                if (nodefs.existsSync(dest)) nodefs.unlinkSync(dest);
+            } catch { /* ignore */ }
+        }
+        renderPlaylist();
+        showToast('Thumbnail reset', 'info', 'media');
+    },
     ctxPlyShowFolder: () => {
         const file = window.playlist[window.ctxPlaylistIndex];
         if (!file?.path || file.isWeb) return;
@@ -505,6 +646,169 @@ window.app = {
             showToast('Displayed in Grid', 'success', 'grid');
         }
         closeContextMenu();
+    },
+
+    // ── FEATURE 1: Custom Thumbnail capture from grid ──────────
+    ctxPlyCaptureThumbnailFromGrid: () => {
+        const index = window.ctxPlaylistIndex;
+        closeContextMenu();
+        if (index < 0) return;
+
+        const file = window.playlist[index];
+        if (!file) return;
+
+        const isVid = (file.type || '').startsWith('video/') || /\.(mp4|mkv|ts|m2ts|webm|avi|mov|wmv|flv|3gp|ogv)$/i.test(file.name);
+        if (!isVid) { showToast('Custom thumbnails are for videos only', 'warning', 'media'); return; }
+
+        // Find a grid cell currently playing this video (by currentIndex matching)
+        let targetVid = null;
+        document.querySelectorAll('.grid-cell').forEach(cell => {
+            if (parseInt(cell.dataset.currentIndex) === index) {
+                const v = cell.querySelector('video.media-active');
+                if (v) targetVid = v;
+            }
+        });
+
+        // If not currently in a cell, find ANY cell with an active video for this file by src
+        if (!targetVid) {
+            const fileUrl = file.path ? 'file://' + file.path.replace(/\\/g, '/') : null;
+            if (fileUrl) {
+                document.querySelectorAll('.grid-cell video.media-active').forEach(v => {
+                    if (!targetVid && (v.src === fileUrl || v.src.startsWith(fileUrl + '?'))) targetVid = v;
+                });
+            }
+        }
+
+        if (!targetVid) {
+            showToast('Video not found in any grid cell. Show it in the grid first.', 'warning', 'media');
+            return;
+        }
+
+        // Capture the current frame
+        try {
+            const w = targetVid.videoWidth  || 320;
+            const h = targetVid.videoHeight || 180;
+            const ratio  = w / h;
+            const thumbH = 100;
+            const thumbW = Math.round(thumbH * ratio);
+
+            const canvas = new OffscreenCanvas(thumbW, thumbH);
+            const ctx    = canvas.getContext('2d');
+            ctx.drawImage(targetVid, 0, 0, thumbW, thumbH);
+
+            canvas.convertToBlob({ type: 'image/webp', quality: 0.85 }).then(async blob => {
+                canvas.width = 0; canvas.height = 0;
+
+                let thumbnailUrl = null;
+
+                if (window.isElectron) {
+                    try {
+                        const nodefs   = require('fs');
+                        const nodepath = require('path');
+                        const isPackaged = !process.defaultApp && !/node_modules/.test(process.execPath);
+                        const baseDir    = isPackaged ? nodepath.dirname(process.execPath) : __dirname;
+                        const thumbDir   = nodepath.join(baseDir, 'data', 'thumbnails');
+                        if (!nodefs.existsSync(thumbDir)) nodefs.mkdirSync(thumbDir, { recursive: true });
+
+                        // Derive the same filename the thumb system uses
+                        function _ghStr(str) { let h = 0; for (let i=0;i<str.length;i++){h=((h<<5)-h)+str.charCodeAt(i);h|=0;} return Math.abs(h).toString(36); }
+                        const fileId = file.path || (file.name + '_' + file.size);
+                        const fname  = file.name.replace(/[^a-z0-9]/gi,'_').substring(0,30) + '_' + _ghStr(fileId) + '.webp';
+                        const dest   = nodepath.join(thumbDir, fname);
+                        const tmp    = dest + '.tmp';
+
+                        const buf = Buffer.from(await blob.arrayBuffer());
+                        nodefs.writeFileSync(tmp, buf);
+                        nodefs.renameSync(tmp, dest);
+                        thumbnailUrl = 'file://' + dest.replace(/\\/g, '/') + '?t=' + Date.now();
+                    } catch (e) {
+                        console.error('[thumb] Electron save failed:', e);
+                        thumbnailUrl = URL.createObjectURL(blob);
+                    }
+                } else {
+                    thumbnailUrl = URL.createObjectURL(blob);
+                }
+
+                // Update RAM cache and file object
+                if (window.thumbCache) window.thumbCache.set(file.path || (file.name + '_' + file.size), thumbnailUrl);
+                file.thumbnailUrl = thumbnailUrl;
+                renderPlaylist();
+                showToast('Thumbnail updated from current frame ✓', 'success', 'media');
+            }).catch(() => showToast('Failed to capture frame', 'error', 'media'));
+        } catch (e) {
+            console.error('[thumb] Capture failed:', e);
+            showToast('Failed to capture thumbnail', 'error', 'media');
+        }
+    },
+
+    ctxPlyResetThumbnail: () => {
+        const index = window.ctxPlaylistIndex;
+        closeContextMenu();
+        if (index < 0) return;
+        const file = window.playlist[index];
+        if (!file) return;
+        const fileId = file.path || (file.name + '_' + file.size);
+
+        // Remove from RAM cache
+        if (window.thumbCache) window.thumbCache.delete(fileId);
+        file.thumbnailUrl = null;
+
+        // Remove from disk (Electron)
+        if (window.isElectron) {
+            try {
+                const nodefs   = require('fs');
+                const nodepath = require('path');
+                const isPackaged = !process.defaultApp && !/node_modules/.test(process.execPath);
+                const baseDir    = isPackaged ? nodepath.dirname(process.execPath) : __dirname;
+                const thumbDir   = nodepath.join(baseDir, 'data', 'thumbnails');
+                function _ghStr(str) { let h=0; for(let i=0;i<str.length;i++){h=((h<<5)-h)+str.charCodeAt(i);h|=0;} return Math.abs(h).toString(36); }
+                const fname = file.name.replace(/[^a-z0-9]/gi,'_').substring(0,30) + '_' + _ghStr(fileId) + '.webp';
+                const dest  = nodepath.join(thumbDir, fname);
+                if (nodefs.existsSync(dest)) nodefs.unlinkSync(dest);
+            } catch { /* ignore */ }
+        }
+
+        renderPlaylist();
+        showToast('Thumbnail reset — will regenerate on next load', 'info', 'media');
+    },
+
+    // ── FEATURE 2: Clear all thumbnails and Res/Ratio cache ───
+    clearThumbAndMetaCache: () => {
+        if (!confirm('This will delete ALL saved thumbnails and Res/Ratio data from disk.\n\nThey will be re-generated next time files are loaded.\n\nContinue?')) return;
+
+        // Clear RAM caches (thumbCache + metaCache + cancel pending flush)
+        if (typeof window.clearAllMediaCaches === 'function') window.clearAllMediaCaches();
+        window.playlist.forEach(f => { f.thumbnailUrl = null; f.metaDataStr = null; });
+
+        if (window.isElectron) {
+            try {
+                const nodefs   = require('fs');
+                const nodepath = require('path');
+                const isPackaged = !process.defaultApp && !/node_modules/.test(process.execPath);
+                const baseDir    = isPackaged ? nodepath.dirname(process.execPath) : __dirname;
+
+                // Delete thumbnail files
+                const thumbDir = nodepath.join(baseDir, 'data', 'thumbnails');
+                if (nodefs.existsSync(thumbDir)) {
+                    nodefs.readdirSync(thumbDir).forEach(f => {
+                        try { nodefs.unlinkSync(nodepath.join(thumbDir, f)); } catch { }
+                    });
+                }
+
+                // Delete metadata file
+                const metaFile = nodepath.join(baseDir, 'data', 'Res&Ratio', 'metadata.json');
+                if (nodefs.existsSync(metaFile)) { try { nodefs.unlinkSync(metaFile); } catch { } }
+
+                showToast('All thumbnails & Res/Ratio cache cleared ✓', 'success', 'system');
+            } catch (e) {
+                console.error('[cache] Clear failed:', e);
+                showToast('Failed to clear disk cache', 'error', 'system');
+            }
+        } else {
+            showToast('RAM cache cleared (disk cache not available in browser mode)', 'info', 'system');
+        }
+
+        renderPlaylist();
     }
 };
 
@@ -613,7 +917,11 @@ function addWebUrls() {
 
     const wasEmpty = !window.playlist.length;
     if (window.settings.shuffle) {
-        window.originalPlaylist = (window.originalPlaylist || []).concat(newTracks);
+        // FIX 7: Deduplicate before appending to originalPlaylist so repeated
+        // add-folder / add-URL calls don't create duplicates in the restored order.
+        const origPaths = new Set((window.originalPlaylist || []).map(f => f.path));
+        const dedupedTracks = newTracks.filter(f => !origPaths.has(f.path));
+        window.originalPlaylist = (window.originalPlaylist || []).concat(dedupedTracks);
         window.playlist = window.playlist.concat(newTracks);
         const cur = window.playlist[window.currentTrack];
         shuffleArray(window.playlist);
@@ -777,7 +1085,11 @@ async function processLiveQueue() {
     while (window.liveFileQueue.length) {
         const fileData = window.liveFileQueue.shift();
         if (window.settings.shuffle) {
-            window.originalPlaylist = (window.originalPlaylist || []).concat([fileData]);
+            // FIX 7: Only add to originalPlaylist if not already present.
+            const origPaths = new Set((window.originalPlaylist || []).map(f => f.path));
+            if (!origPaths.has(fileData.path)) {
+                window.originalPlaylist = (window.originalPlaylist || []).concat([fileData]);
+            }
             window.playlist.push(fileData);
             const cur = window.playlist[window.currentTrack];
             shuffleArray(window.playlist);
@@ -915,6 +1227,11 @@ function performClearAll() {
     document.querySelectorAll('.grid-cell').forEach(c => { c.privateQueue = []; c.classList.remove('has-private-queue'); });
     _instantRamPurge(all, true);
     window.playlist = []; window.originalPlaylist = [];
+    // FIX 9: A full playlist wipe must also reset the shuffle history so that
+    // index numbers from the old playlist don't poison the first cycle of any
+    // new playlist loaded after this clear.
+    window.shuffleCycleHistory?.clear();
+    document.querySelectorAll('.grid-cell').forEach(c => { delete c._seqIdx; });
     checkQueueState();
     showToast('Queue Cleared', 'info', 'queue');
 }
@@ -982,7 +1299,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.applySettingsToUI?.();
     window.renderGridOptions?.();
-    if (window.settings?.wakeLock) setWakeLock?.(true);
     if (!window.settings.liveFolders) window.settings.liveFolders = [];
     window.isLiveRunning = false;
 
@@ -1122,20 +1438,39 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
         window.saveConfig(); renderPlaylist();
+        // FIX 8+9: Clear history and recalculate nextQueueIndex for BOTH
+        // shuffle-on and shuffle-off so the queue pointer always reflects
+        // the new playlist order, not the previous (shuffled or sequential) one.
         window.shuffleCycleHistory?.clear();
-        if (window.playlist.length) window.nextQueueIndex = (window.currentTrack + getGridCapacity()) % window.playlist.length;
+        if (window.playlist.length) {
+            window.nextQueueIndex = (window.currentTrack + getGridCapacity()) % window.playlist.length;
+            // Also reset every cell's per-cell cursor so the next fill is
+            // consistent with the restored order.
+            document.querySelectorAll('.grid-cell').forEach((cell, i) => {
+                cell._seqIdx = (window.currentTrack + i) % window.playlist.length;
+            });
+        }
         if (window.settings.mode === 'slideshow') updateGridContents?.();
         showToast(on ? 'Shuffle Active' : 'Original Order Restored', 'info', 'queue');
     };
 
     // ── Global controls ───────────────────────────────────────
     document.getElementById('globalMuteBtn').onclick  = toggleGlobalMute;
-    document.getElementById('playPauseBtn').onclick   = toggleGlobalPlayPause;
+    document.getElementById('playPauseBtn').onclick = () => {
+        if (!window.playlist.length && typeof window.loadRecentQueue === 'function') {
+            const queueData = window.loadRecentQueue();
+            if (queueData?.files?.length) { showRestoreQueueModal(queueData); return; }
+        }
+        toggleGlobalPlayPause();
+    };
     document.getElementById('fsBtn').onclick = () => {
         if (document.body.classList.contains('minimal-ui') || document.fullscreenElement) {
             if (window.isElectron) { try { require('electron').ipcRenderer.send('app-command', 'restore'); } catch { } }
             if (document.fullscreenElement) document.exitFullscreen();
-            document.body.classList.remove('minimal-ui', 'split-active', 'split-left', 'split-right', 'split-top', 'split-bottom');
+            // FIX 12: fully unwind fullscreen UI state here too — not just
+            // 'minimal-ui' — so #toggleSidebarBtn, is-fullscreen and the
+            // sidebar overlay classes are all cleaned up together.
+            applyFullscreenUI(false);
         } else setFullscreen('full');
     };
     document.getElementById('toggleSidebarBtn').onclick = () => {
@@ -1167,20 +1502,11 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('settingsModal').classList.add('open');
     };
     document.getElementById('resetKeysBtn').onclick = () => {
-        window.keyMap = {
-            play: 'Space', forward: 'ArrowRight', rewind: 'ArrowLeft', fullscreen: 'KeyF',
-            next: 'KeyN', home: 'KeyH', minimize: 'KeyM', sidebar: 'KeyS',
-            clearImg: null, clearVid: null, clearAll: null, replayA: null, replayB: null,
-            moveApp: 'AuxClick1', hideUI: null,
-            forward5: null, backward5: null, forward30: null, backward30: null,
-            ramFlush: 'KeyG'        // ← default RAM flush shortcut
-        };
+        window.keyMap = { ...window.DEFAULT_KEYS };
         window.saveConfig(); renderKeybinds(); updateFooter();
     };
 
     // ── Settings sliders/toggles ──────────────────────────────
-    if (els.shortcutsToggle) { els.shortcutsToggle.onchange = e => { window.settings.showShortcuts = e.target.checked; document.getElementById('shortcutsFooter').style.display = e.target.checked ? 'flex' : 'none'; window.saveConfig(); }; }
-    els.oledToggle.addEventListener('change', e => window.setBg(e.target.checked ? 1 : 0));
     els.gridSel.onchange   = e => { window.settings.gridSize = e.target.value; window.saveConfig(); if (els.grid.style.display !== 'none') { window.initGrid?.(); updateGridContents?.(); } };
     els.effectSel.onchange = e => { window.settings.effect = e.target.value; window.saveConfig(); };
     els.durInput.oninput   = e => { window.settings.duration = e.target.value * 1000; els.durVal.textContent = e.target.value; saveConfigDebounced(); };
@@ -1190,7 +1516,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (els.floatOpacityInput) { els.floatOpacityInput.oninput = e => { window.settings.floatOpacity = +e.target.value; els.floatOpacityVal.textContent = window.settings.floatOpacity; document.documentElement.style.setProperty('--float-opacity', window.settings.floatOpacity); saveConfigDebounced(); }; }
     els.fxSpeedInput.oninput   = e => { window.settings.effectSpeed = +e.target.value; els.fxSpeedVal.textContent = window.settings.effectSpeed; document.documentElement.style.setProperty('--fx-speed', window.settings.effectSpeed + 's'); saveConfigDebounced(); };
     if (els.applyGridBtn) { els.applyGridBtn.onclick = () => { window.settings.gridSize = els.gridSel.value; window.saveConfig(); if (els.grid.style.display !== 'none') { window.initGrid?.(); updateGridContents?.(); } const btn = els.applyGridBtn; const old = btn.textContent; btn.textContent = '✓'; btn.style.color = '#22c55e'; setTimeout(() => { btn.textContent = old; btn.style.color = ''; }, 600); }; }
-    if (els.wakeLockToggle)   { els.wakeLockToggle.onchange   = e => { window.settings.wakeLock = e.target.checked; window.saveConfig(); setWakeLock?.(window.settings.wakeLock); }; }
     if (els.queueInfoToggle)  { els.queueInfoToggle.onchange  = e => { window.settings.showQueueInfo = e.target.checked; if (els.editorQueueInfo) els.editorQueueInfo.checked = e.target.checked; window.saveConfig(); renderPlaylist(); window.renderEditOverlays?.(); }; }
     if (els.thumbnailToggle)  { els.thumbnailToggle.onchange  = e => { window.settings.showThumbnails = e.target.checked; window.saveConfig(); renderPlaylist(); }; }
     if (els.editorQueueInfo)  { els.editorQueueInfo.onchange  = e => { window.settings.showQueueInfo = e.target.checked; if (els.queueInfoToggle) els.queueInfoToggle.checked = e.target.checked; window.saveConfig(); renderPlaylist(); window.renderEditOverlays?.(); }; }
@@ -1200,6 +1525,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (els.minRandInput) { els.minRandInput.oninput = e => { let v = +e.target.value, mx = +els.maxRandInput.value; if (v > mx - 5) { v = mx - 5; e.target.value = v; } window.settings.minRandomDuration = v; if (els.minRandVal) els.minRandVal.textContent = v; saveConfigDebounced(); }; }
     if (els.maxRandInput) { els.maxRandInput.oninput = e => { let v = +e.target.value, mn = +els.minRandInput.value; if (v < mn + 5) { v = mn + 5; e.target.value = v; } window.settings.maxRandomDuration = v; if (els.maxRandVal) els.maxRandVal.textContent = v; saveConfigDebounced(); }; }
     if (els.randomEffectToggle) { els.randomEffectToggle.onchange = e => { window.settings.randomEffect = e.target.checked; els.effectSel.disabled = e.target.checked; els.effectSel.style.opacity = e.target.checked ? '0.5' : '1'; window.saveConfig(); }; }
+    // Feature 4: Video effect handlers
+    if (els.videoEffectSel) { els.videoEffectSel.onchange = e => { window.settings.videoEffect = e.target.value; window.saveConfig(); }; }
+    if (els.randomVideoEffectToggle) { els.randomVideoEffectToggle.onchange = e => { window.settings.randomVideoEffect = e.target.checked; if (els.videoEffectSel) { els.videoEffectSel.disabled = e.target.checked; els.videoEffectSel.style.opacity = e.target.checked ? '0.5' : '1'; } window.saveConfig(); }; }
+    // Feature 2: Clear cache button
+    if (els.clearThumbCacheBtn) { els.clearThumbCacheBtn.onclick = () => app.clearThumbAndMetaCache(); }
     if (els.advanceRatioToggle) { els.advanceRatioToggle.onchange = e => { window.settings.advanceRatioMode = e.target.checked; window.saveConfig(); if (window.isEditingLayout) window.renderEditOverlays?.(); }; }
     if (els.liveFolderToggle) { els.liveFolderToggle.onchange = e => { window.settings.enableLiveFolder = e.target.checked; window.saveConfig(); if (els.liveFolderBtn) { els.liveFolderBtn.style.display = e.target.checked ? 'flex' : 'none'; if (e.target.checked) els.liveFolderBtn.style.animation = 'popIn 0.3s cubic-bezier(0.175,0.885,0.32,1.275)'; } if (els.liveSortGroup) els.liveSortGroup.style.display = e.target.checked ? 'block' : 'none'; window.applySettingsToUI?.(); if (!e.target.checked) { stopAllWatchers(); window.isLiveRunning = false; } }; }
     if (els.countdownToggle) { els.countdownToggle.onchange = e => { window.settings.showCountdown = e.target.checked; window.saveConfig(); if (window.settings.mode === 'slideshow') updateGridContents?.(); }; }
@@ -1209,9 +1539,18 @@ document.addEventListener('DOMContentLoaded', () => {
     if (els.liveFolderBtn) { els.liveFolderBtn.onclick = e => { e.preventDefault(); openLiveManager(); }; }
     if (els.hybridToggle) { els.hybridToggle.onchange = e => { window.settings.hybridMode = e.target.checked; window.saveConfig(); showToast(e.target.checked ? 'Hybrid Mode: Images on CPU' : 'Hybrid Mode: Disabled', 'info', 'system'); if (window.settings.mode === 'slideshow') updateGridContents?.(); }; }
 
+    if (els.volumeBoostToggle) {
+        els.volumeBoostToggle.onchange = e => {
+            window.settings.volumeBoost = e.target.checked;
+            window.saveConfig();
+            refreshVolumeBoostUI();
+            showToast(e.target.checked ? 'Volume Boost: up to 1000%' : 'Volume Boost: Off (max 100%)', 'info', 'system');
+        };
+    }
+
     // Global volume
     const gvs = document.getElementById('globalVolSlider');
-    if (gvs) gvs.addEventListener('input', e => { const v = +e.target.value; window.settings.globalVolume = v; saveConfigDebounced(); applyGlobalVolume(v); updateGlobalVolIcon(v); if (els.globalVolDisplay) els.globalVolDisplay.textContent = Math.round(v * 100) + '%'; });
+    if (gvs) gvs.addEventListener('input', e => { const v = readVolumeSlider(e.target); window.settings.globalVolume = v; saveConfigDebounced(); applyGlobalVolume(v); updateGlobalVolIcon(v); if (els.globalVolDisplay) els.globalVolDisplay.textContent = Math.round(v * 100) + '%'; });
     const spd = document.getElementById('speedSlider');
     if (spd) spd.addEventListener('input', e => setPlaybackSpeed(e.target.value));
 
@@ -1224,6 +1563,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     updateFooter(); setupDraggableModals(); initContextMenu();
+
+    if (window.keyConflictsCleared?.length) {
+        const names = window.keyConflictsCleared.map(id => actionConfig.find(a => a.id === id)?.label || id).join(', ');
+        window.keyConflictsCleared = [];
+        window.saveConfig();
+        showToast(`Duplicate shortcut keys found. Cleared for: ${names}. Re-assign them in Settings.`, 'warning', 'system');
+    }
 
     // ── Window drag via IPC ───────────────────────────────────
     window.addEventListener('mousedown', e => {
@@ -1299,11 +1645,31 @@ function confirmExit()      { if (window.isElectron) { try { require('electron')
 function minimizeApp()      { if (window.isElectron) { try { require('electron').ipcRenderer.send('app-command', 'minimize'); } catch { } } }
 
 let isPinned = false;
+function syncPinUI(pinned) {
+    isPinned = !!pinned;
+    const btn = document.getElementById('pinBtn');
+    if (btn) {
+        btn.classList.toggle('active', isPinned);
+        btn.title = isPinned ? 'Always on Top (ON)' : 'Always on Top';
+    }
+}
 function toggleAlwaysOnTop() {
-    isPinned = !isPinned;
-    document.getElementById('pinBtn')?.classList.toggle('active', isPinned);
-    showToast(isPinned ? 'Window Pinned on Top' : 'Window Unpinned', 'info', 'system');
-    if (window.isElectron) { try { require('electron').ipcRenderer.send('app-command', 'toggle-pin'); } catch { } }
+    if (!window.isElectron) return showToast('PC Only', 'warning', 'system');
+    const next = !isPinned;
+    syncPinUI(next);
+    showToast(next ? 'Window Pinned on Top' : 'Window Unpinned', 'info', 'system');
+    // Send the explicit desired state; main.js is the source of truth and
+    // replies with 'pin-status' so the button can never get out of sync.
+    try { require('electron').ipcRenderer.send('app-command', 'set-pin', next); } catch { }
+}
+
+// Mirror the real pin state from the main process (also covers page reloads)
+if (window.isElectron) {
+    try {
+        const { ipcRenderer } = require('electron');
+        ipcRenderer.on('pin-status', (_event, pinned) => syncPinUI(pinned));
+        ipcRenderer.send('app-command', 'get-pin');
+    } catch { }
 }
 function toggleServer() { if (window.isElectron) { try { require('electron').ipcRenderer.send('app-command', 'toggle-server'); } catch { } } }
 
@@ -1389,7 +1755,14 @@ function processFiles(files) {
 
     if (window.settings.shuffle) {
         if (!window.originalPlaylist?.length && window.playlist.length) window.originalPlaylist = [...window.playlist];
-        window.originalPlaylist = (window.originalPlaylist || []).concat(newFiles);
+        // FIX 7: Deduplicate newFiles against originalPlaylist to prevent
+        // duplicates in the restored (un-shuffled) order when the same folder
+        // is added more than once while shuffle is active.
+        const origPaths = new Set((window.originalPlaylist || []).map(f =>
+            f.path ? f.path : `${f.name}:${f.size}`));
+        const dedupedForOrig = newFiles.filter(f =>
+            !origPaths.has(f.path ? f.path : `${f.name}:${f.size}`));
+        window.originalPlaylist = (window.originalPlaylist || []).concat(dedupedForOrig);
         window.playlist = window.playlist.concat(newFiles);
         const cur = window.playlist[window.currentTrack];
         shuffleArray(window.playlist);
@@ -1529,40 +1902,79 @@ function toggleGlobalMute() {
     });
 }
 
+// The grid cell currently under the mouse pointer (innermost match), or null.
+function getHoveredGridCell() {
+    const hovered = document.querySelectorAll('.grid-cell:hover');
+    return hovered.length ? hovered[hovered.length - 1] : null;
+}
+
+// The live (non-fading-out) <video> inside a grid cell, or null for image cells.
+function getCellVideo(cell) {
+    if (!cell) return null;
+    return cell.querySelector('video.media-active') ||
+           cell.querySelector('video:not(.media-old)');
+}
+
+// Seek keys (+5 / -5 / +30 / -30):
+//   · Single-video mode → seeks the main player (unchanged).
+//   · Grid / slideshow mode → seeks ONLY the video in the cell the mouse is
+//     hovering over. If no video cell is hovered, nothing happens.
 function seekVideos(seconds) {
     const els = getEls();
     if (window.settings.mode === 'video') {
         if (!els.video.paused || els.video.currentTime > 0) els.video.currentTime = Math.max(0, els.video.currentTime + seconds);
-    } else {
-        document.querySelectorAll('.grid-cell video.media-active').forEach(v => {
-            v.currentTime = Math.max(0, v.currentTime + seconds);
-        });
+        return;
     }
+
+    const v = getCellVideo(getHoveredGridCell());
+    if (!v) return;
+    const dur = isFinite(v.duration) ? v.duration : Infinity;
+    v.currentTime = Math.max(0, Math.min(v.currentTime + seconds, dur));
 }
 
-function setFullscreen(type) {
-    const body = document.body;
-    body.classList.remove('split-active','split-left','split-right','split-top','split-bottom','minimal-ui');
-    body.classList.add('minimal-ui');
-    if (window.isElectron) { try { require('electron').ipcRenderer.send('app-command', type); } catch { } }
-    else { if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {}); }
-}
-
-function handleFsChange() {
-    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-    const sb   = document.getElementById('sidebar');
-    const dh   = document.getElementById('dragHandle');
+// FIX 12: Single source of truth for "entering/leaving fullscreen" UI
+// state. Both the Electron-native path (fsBtn → IPC → win.setFullScreen,
+// which never fires a DOM 'fullscreenchange' event) and the real DOM
+// Fullscreen API path (keyboard shortcut → mainStage.requestFullscreen,
+// which does fire that event) now funnel through this one function, so
+// #sidebar / body always end up with a consistent, correct class set
+// no matter which path triggered the change.
+function applyFullscreenUI(isFs) {
+    const sb = document.getElementById('sidebar');
+    const dh = document.getElementById('dragHandle');
     clearTimeout(sidebarAutoHideTimer);
     if (isFs) {
-        document.body.classList.add('is-fullscreen');
+        document.body.classList.remove('split-active','split-left','split-right','split-top','split-bottom');
+        document.body.classList.add('is-fullscreen', 'minimal-ui');
+        // Sidebar must carry 'collapsed' immediately — .ctrl-right's
+        // right-offset depends on #sidebar.collapsed to hug the true
+        // right edge instead of reserving space for the (now hidden)
+        // open sidebar. Without this, fsBtn/toggleSidebarBtn visibly
+        // drift away from the edge as soon as fullscreen is entered.
         sb?.classList.add('overlay-mode', 'collapsed');
         dh?.classList.add('collapsed');
     } else {
-        document.body.classList.remove('is-fullscreen','split-active','split-left','split-right','split-top','split-bottom','minimal-ui');
+        document.body.classList.remove('is-fullscreen','minimal-ui','split-active','split-left','split-right','split-top','split-bottom');
         sb?.classList.remove('overlay-mode');
         sb?.classList.add('collapsed');
         dh?.classList.add('collapsed');
     }
+}
+
+function setFullscreen(type) {
+    // Apply the UI state ourselves right away — don't wait on
+    // 'fullscreenchange', which Electron's native fullscreen never fires.
+    applyFullscreenUI(true);
+    if (window.isElectron) { try { require('electron').ipcRenderer.send('app-command', type); } catch { } }
+    else { if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {}); }
+}
+
+// Kept for the real DOM Fullscreen API path (e.g. the 'fullscreen'
+// keyboard shortcut, which calls mainStage.requestFullscreen() directly
+// rather than going through setFullscreen()/Electron IPC).
+function handleFsChange() {
+    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    applyFullscreenUI(isFs);
 }
 document.addEventListener('fullscreenchange', handleFsChange);
 
@@ -1578,13 +1990,33 @@ function _togglePanel(bodyId, btnId) {
 
 // ── AUDIO / VOLUME ────────────────────────────────────────────
 function applyGlobalVolume(vol) {
+    vol = clampVolume(vol);
     const main = document.getElementById('videoPlayer');
-    if (main) main.volume = vol;
+    if (main) main.volume = Math.min(1, vol);      // native-controls player: no boost
     document.querySelectorAll('.grid-cell').forEach(cell => {
         const vid = cell.querySelector('video');
-        if (vid) { vid.volume = vol; if (vol > 0 && vid.muted && !window.isGlobalMuted) vid.muted = false; }
+        if (vid) { setMediaVolume(vid, vol); if (vol > 0 && vid.muted && !window.isGlobalMuted) vid.muted = false; }
         const sl = cell.querySelector('.cell-vol-slider');
-        if (sl) sl.value = vol;
+        if (sl) { setVolumeSlider(sl, vol); sl.title = Math.round(vol * 100) + '%'; }
+    });
+}
+
+// Called when the "Volume Boost" option is switched on/off: re-ranges every
+// volume slider and, when turning it off, pulls anything above 100% back to 100%.
+function refreshVolumeBoostUI() {
+    const els = getEls();
+    const gv  = clampVolume(window.settings.globalVolume ?? 1);
+    window.settings.globalVolume = gv;
+    setVolumeSlider(els.globalVolSlider, gv);
+    if (els.globalVolDisplay) els.globalVolDisplay.textContent = Math.round(gv * 100) + '%';
+    updateGlobalVolIcon(gv);
+
+    document.querySelectorAll('.grid-cell').forEach(cell => {
+        if (cell.dataset.savedVolume !== undefined) cell.dataset.savedVolume = clampVolume(cell.dataset.savedVolume);
+        cell.querySelectorAll('video').forEach(v => setMediaVolume(v, getMediaVolume(v)));   // re-clamp
+        const vid = cell.querySelector('video.media-active') || cell.querySelector('video');
+        const sl  = cell.querySelector('.cell-vol-slider');
+        if (sl && vid) { setVolumeSlider(sl, getMediaVolume(vid)); sl.title = Math.round(getMediaVolume(vid) * 100) + '%'; }
     });
 }
 function updateGlobalVolIcon(vol) {
@@ -1679,10 +2111,11 @@ function toggleNotification(key) {
 // ── KEYBIND PANEL ─────────────────────────────────────────────
 const actionConfig = [
     { id: 'play',      label: 'Play / Pause' },
-    { id: 'forward',   label: 'Seek / Next' },
-    { id: 'rewind',    label: 'Previous' },
+    { id: 'forward',   label: 'Seek +5s / Next Batch' },   // FIX 6: clarified label
+    { id: 'rewind',    label: 'Seek -5s / Prev Batch' },   // FIX 6: clarified label
     { id: 'fullscreen',label: 'Fullscreen' },
-    { id: 'next',      label: 'Next Batch' },
+    { id: 'next',      label: 'Next Batch (Slideshow)' },
+    { id: 'prev',      label: 'Prev Batch (Slideshow)' },  // FIX 10: new dedicated prev
     { id: 'home',      label: 'Go Home' },
     { id: 'minimize',  label: 'Minimize' },
     { id: 'sidebar',   label: 'Toggle Sidebar' },
@@ -1693,10 +2126,12 @@ const actionConfig = [
     { id: 'clearAll',  label: 'Clear Queue' },
     { id: 'replayA',   label: 'Replay A (Start)' },
     { id: 'replayB',   label: 'Replay B (End)' },
-    { id: 'forward5',  label: 'Seek +5s' },
-    { id: 'backward5', label: 'Seek -5s' },
-    { id: 'forward30', label: 'Seek +30s' },
-    { id: 'backward30',label: 'Seek -30s' },
+    { id: 'startPoint',label: '📍 Start Point: set / cancel (hovered cell)' },
+    { id: 'endPoint',  label: '🏁 End Point: set / cancel (hovered cell)' },
+    { id: 'forward5',  label: 'Seek +5s (hovered cell)' },
+    { id: 'backward5', label: 'Seek -5s (hovered cell)' },
+    { id: 'forward30', label: 'Seek +30s (hovered cell)' },
+    { id: 'backward30',label: 'Seek -30s (hovered cell)' },
     // ── NEW: RAM flush shortcut ──────────────────────────────
     { id: 'ramFlush',  label: '🧹 RAM Flush + Seek Back' }
 ];
@@ -1709,14 +2144,28 @@ function renderKeybinds() {
 
     actionConfig.forEach(action => {
         const code = window.keyMap[action.id];
-        const row  = document.createElement('div'); row.className = 'key-row';
+        const row  = document.createElement('div'); row.className = 'key-row'; row.dataset.action = action.id;
         row.innerHTML = `<span>${action.label}</span>`;
 
         const wrap = document.createElement('div'); wrap.style.cssText = 'display:flex;gap:5px;';
         const btn  = document.createElement('button'); btn.className = 'key-btn'; btn.textContent = code ? formatKey(code) : 'None'; if (!code) btn.style.color = '#777';
         btn.onclick = () => {
             btn.textContent = '…'; btn.classList.add('recording');
-            const h = e => { e.preventDefault(); e.stopPropagation(); window.keyMap[action.id] = e.code; window.saveConfig(); renderKeybinds(); updateFooter(); document.removeEventListener('keydown', h); };
+            const h = e => {
+                e.preventDefault(); e.stopPropagation();
+                document.removeEventListener('keydown', h);
+                if (!e.code) { renderKeybinds(); return; }
+                // ONE KEY = ONE ACTION: refuse a key that another action already owns
+                const owner = Object.keys(window.keyMap).find(k => k !== action.id && window.keyMap[k] === e.code);
+                if (owner) {
+                    renderKeybinds();                                   // reset the button text
+                    const ownerLabel = actionConfig.find(a => a.id === owner)?.label || owner;
+                    flashKeyConflict(owner);                            // visible even if notifications are off
+                    showToast(`"${formatKey(e.code)}" is already used by "${ownerLabel}". Remove it there first.`, 'warning', 'system');
+                    return;
+                }
+                window.keyMap[action.id] = e.code; window.saveConfig(); renderKeybinds(); updateFooter();
+            };
             document.addEventListener('keydown', h, { once: true });
         };
         const del  = document.createElement('button'); del.className = 'key-btn'; del.textContent = '🗑️'; del.style.cssText = 'min-width:30px;padding:0;'; del.title = 'Remove';
@@ -1759,16 +2208,147 @@ function renderKeybinds() {
     }, 0);
 }
 
-function updateFooter() {
-    const sf = document.getElementById('shortcutsFooter');
-    if (!sf) return;
-    sf.innerHTML = actionConfig
-        .filter(a => window.keyMap[a.id])
-        .map(a => `<div class="footer-action" onclick="triggerAction('${a.id}')"><span class="key-badge">${formatKey(window.keyMap[a.id])}</span> ${a.label}</div>`)
-        .join('');
-}
+function updateFooter() { /* Keyboard shortcuts bar removed */ }
 
 // ── ACTION DISPATCHER ─────────────────────────────────────────
+// ── RECENT QUEUE RESTORE ──────────────────────────────────────
+// Called by triggerAction('play') when the queue is empty on startup.
+// Shows a styled modal (not browser confirm) with Yes / Cancel.
+
+function _getTimeAgoStr(ts) {
+    if (!ts) return '';
+    const diff = Date.now() - ts;
+    const mins  = Math.floor(diff / 60000);
+    const hours = Math.floor(diff / 3600000);
+    const days  = Math.floor(diff / 86400000);
+    if (mins  <  1) return 'just now';
+    if (mins  < 60) return `${mins} minute${mins !== 1 ? 's' : ''} ago`;
+    if (hours < 24) return `${hours} hour${hours !== 1 ? 's' : ''} ago`;
+    return `${days} day${days !== 1 ? 's' : ''} ago`;
+}
+
+function showRestoreQueueModal(queueData) {
+    const modal    = document.getElementById('restoreQueueModal');
+    const subtitle = document.getElementById('rqSubtitle');
+    const preview  = document.getElementById('rqFilePreview');
+    const yesBtn   = document.getElementById('rqYesBtn');
+    const cancelBtn= document.getElementById('rqCancelBtn');
+    if (!modal) return;
+
+    const count    = queueData.files.length;
+    const timeAgo  = _getTimeAgoStr(queueData.savedAt);
+    const modeLabel= queueData.mode === 'video' ? 'Video' : 'Slideshow';
+    subtitle.textContent = `${count} file${count !== 1 ? 's' : ''} · ${modeLabel} mode · saved ${timeAgo}`;
+
+    // Show first 8 files as preview, with current track highlighted
+    preview.innerHTML = '';
+    const maxPreview = 8;
+    const showFiles  = queueData.files.slice(0, maxPreview);
+    showFiles.forEach((f, i) => {
+        const div = document.createElement('div');
+        div.className = 'rq-preview-item' + (i === queueData.currentTrack ? ' rq-preview-current' : '');
+        div.textContent = (i === queueData.currentTrack ? '▶ ' : '') + f.name;
+        div.title = f.path || f.name;
+        preview.appendChild(div);
+    });
+    if (count > maxPreview) {
+        const more = document.createElement('div');
+        more.className = 'rq-preview-more';
+        more.textContent = `+ ${count - maxPreview} more file${count - maxPreview !== 1 ? 's' : ''}…`;
+        preview.appendChild(more);
+    }
+
+    modal.style.display = 'flex';
+
+    // Focus yes button for keyboard accessibility (Enter = restore)
+    setTimeout(() => yesBtn.focus(), 50);
+
+    // ── Button handlers ───────────────────────────────────────
+    function cleanup() {
+        modal.style.display = 'none';
+        yesBtn.onclick   = null;
+        cancelBtn.onclick= null;
+        document.removeEventListener('keydown', keyHandler);
+    }
+
+    function doRestore() {
+        cleanup();
+        restoreRecentQueue(queueData);
+    }
+
+    function doCancel() {
+        cleanup();
+        // Clear saved queue so we don't ask again next time
+        if (typeof window.clearRecentQueue === 'function') window.clearRecentQueue();
+        showToast('Session restore cancelled', 'info', 'queue');
+    }
+
+    function keyHandler(e) {
+        if (e.key === 'Enter')  { e.preventDefault(); doRestore(); }
+        if (e.key === 'Escape') { e.preventDefault(); doCancel();  }
+    }
+
+    yesBtn.onclick    = doRestore;
+    cancelBtn.onclick = doCancel;
+    document.addEventListener('keydown', keyHandler);
+
+    // Click outside = cancel
+    modal.onclick = e => { if (e.target === modal) doCancel(); };
+}
+
+function restoreRecentQueue(queueData) {
+    if (!queueData?.files?.length) return;
+
+    // Validate files exist on disk before restoring (Electron only)
+    let validFiles = queueData.files;
+    if (window.isElectron) {
+        try {
+            const nodefs = require('fs');
+            validFiles   = queueData.files.filter(f => f.path && nodefs.existsSync(f.path));
+            const missing = queueData.files.length - validFiles.length;
+            if (missing > 0) showToast(`Skipped ${missing} missing file${missing !== 1 ? 's' : ''}`, 'warning', 'file');
+        } catch { /* non-fatal — try to load anyway */ }
+    }
+
+    if (!validFiles.length) {
+        showToast('No valid files found from last session', 'warning', 'queue');
+        if (typeof window.clearRecentQueue === 'function') window.clearRecentQueue();
+        return;
+    }
+
+    // Switch to saved mode if different
+    if (queueData.mode && queueData.mode !== window.settings.mode) {
+        app.selectMode(queueData.mode);
+    }
+
+    // Build file objects and push through processFiles
+    const fileObjs = validFiles.map(f => ({
+        name: f.name,
+        path: f.path,
+        size: f.size || 0,
+        type: f.type || getMimeType(f.name)
+    }));
+
+    processFiles(fileObjs);
+
+    // After processFiles loads and plays track 0, seek to the saved currentTrack
+    const savedTrack = queueData.currentTrack || 0;
+    if (savedTrack > 0) {
+        // Give processFiles a frame to settle, then jump to saved position
+        setTimeout(() => {
+            if (savedTrack < window.playlist.length) {
+                window.currentTrack = savedTrack;
+                loadAndPlay(savedTrack);
+                // Scroll queue list to the restored track
+                const trackEl = document.querySelector(`.track[data-track-index="${savedTrack}"]`);
+                trackEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }, 300);
+    }
+
+    showToast(`Restored ${validFiles.length} files from last session ✓`, 'success', 'queue');
+}
+
 function triggerAction(action) {
     if (!window.isElectron && ['sidebar','home','minimize'].includes(action)) return;
 
@@ -1784,10 +2364,48 @@ function triggerAction(action) {
         return;
     }
 
+    // Start / End point: press once = set at current time, press again = cancel
+    if (action === 'startPoint' || action === 'endPoint') {
+        const hovered = document.querySelector('.grid-cell:hover');
+        if (hovered) toggleCellPoint(hovered, action === 'startPoint' ? 'start' : 'end');
+        else showToast('Hover a playing video cell, then press the key', 'info', 'media');
+        return;
+    }
+
     switch (action) {
-        case 'play':       toggleGlobalPlayPause(); break;
-        case 'forward':    window.settings.mode === 'video' ? seekVideos(5) : playNext(); break;
-        case 'rewind':     window.settings.mode === 'video' ? seekVideos(-5) : playPrev(); break;
+        case 'play':
+            // If queue is empty on startup, offer to restore the last session
+            if (!window.playlist.length && typeof window.loadRecentQueue === 'function') {
+                const queueData = window.loadRecentQueue();
+                if (queueData?.files?.length) {
+                    showRestoreQueueModal(queueData);
+                    break;
+                }
+            }
+            toggleGlobalPlayPause();
+            break;
+        case 'forward':
+            if (window.settings.mode === 'video') {
+                seekVideos(5);
+            } else {
+                // FIX 6: In slideshow mode, ArrowRight seeks ALL active grid
+                // videos (useful when cells show videos), and also advances
+                // the batch so pure-image grids still move forward.
+                const gridVids = document.querySelectorAll('.grid-cell video.media-active');
+                if (gridVids.length) { gridVids.forEach(v => { v.currentTime = Math.min(v.currentTime + 5, v.duration || v.currentTime); }); }
+                else { playNext(); }
+            }
+            break;
+        case 'rewind':
+            if (window.settings.mode === 'video') {
+                seekVideos(-5);
+            } else {
+                // FIX 6: Mirror of forward — seek grid videos back, or go to prev batch.
+                const gridVidsR = document.querySelectorAll('.grid-cell video.media-active');
+                if (gridVidsR.length) { gridVidsR.forEach(v => { v.currentTime = Math.max(v.currentTime - 5, 0); }); }
+                else { playPrev(); }
+            }
+            break;
         case 'forward5':   seekVideos(5);   break;
         case 'backward5':  seekVideos(-5);  break;
         case 'forward30':  seekVideos(30);  break;
@@ -1800,6 +2418,7 @@ function triggerAction(action) {
             document.fullscreenElement ? document.exitFullscreen() : els.mainStage?.requestFullscreen();
             break;
         case 'next':     playNext();    break;
+        case 'prev':     playPrev();    break;    // FIX 10: dedicated prev batch
         case 'home':     goHome();      break;
         case 'minimize': minimizeApp(); break;
         case 'clearImg': performClearImages(); break;
@@ -1855,6 +2474,161 @@ document.addEventListener('keyup', e => {
     }
 });
 
+// ── DOUBLE-CLICK A VIDEO CELL → PLAY / PAUSE THAT CELL ONLY ──
+// One delegated listener on the document, so it keeps working no matter how
+// often grid.js / media-engine.js rebuild the cells. Image cells are ignored.
+const CELL_DBLCLICK_IGNORE =
+    '.cell-controls,.cell-nav-btn,.audio-lock-btn,.cell-save-btn,.transform-bar,' +
+    '.layout-overlay,.floating-handle,.resize-handle,button,input,select,textarea,a';
+
+document.addEventListener('dblclick', e => {
+    if (window.isEditingLayout || window.isMoveKeyHeld) return;
+    if (window.checkLiveModifiers?.(e)) return;            // Shift/Ctrl+click = live-zone selection
+    if (!(e.target instanceof Element)) return;
+
+    const cell = e.target.closest('.grid-cell');
+    if (!cell || e.target.closest(CELL_DBLCLICK_IGNORE)) return;
+
+    const vid = getCellVideo(cell);
+    if (!vid) return;                                      // image cell → nothing to toggle
+
+    e.preventDefault();
+    window.getSelection?.()?.removeAllRanges();            // no stray text selection from the 2nd click
+
+    if (vid.paused) vid.play().catch(() => {});
+    else            vid.pause();
+});
+
+// ── START POINTS (helpers + settings list) ────────────────────
+function formatSP(sec) {
+    sec = Math.max(0, Math.floor(+sec || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
+function _spEsc(t) { return String(t).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c])); }
+
+function renderStartPointList() {
+    const box = document.getElementById('startPointList');
+    if (!box) return;
+    const sp    = window.startPoints || {};
+    const total = Object.keys(sp).length;
+    const isNum = v => typeof v === 'number' && isFinite(v);
+
+    // Videos currently in the queue that have a saved start and/or end point (queue order)
+    const seen = new Set();
+    const rows = [];
+    (window.playlist || []).forEach((f, qi) => {
+        const id = window.getStartPointId(f);
+        const e  = id && sp[id];
+        if (e && (isNum(e.time) || isNum(e.end)) && !seen.has(id)) {
+            seen.add(id);
+            rows.push({ id, qi, name: f.name, path: f.path, s: isNum(e.time) ? e.time : null, e: isNum(e.end) ? e.end : null });
+        }
+    });
+
+    const countEl = document.getElementById('startPointCount');
+    const delBtn  = document.getElementById('clearAllStartPointsBtn');
+    const note    = document.getElementById('startPointOtherNote');
+    const others  = total - rows.length;
+    if (countEl) countEl.textContent = rows.length ? `(${rows.length})` : '';
+    if (delBtn)  delBtn.disabled = total === 0;
+    if (note) {
+        note.style.display = others > 0 ? 'block' : 'none';
+        note.textContent   = `+ ${others} more saved for videos not in the current queue (removed by Delete All).`;
+    }
+
+    box.textContent = '';
+    if (!rows.length) {
+        const empty = document.createElement('div');
+        empty.className = 'sp-empty';
+        empty.textContent = (window.playlist || []).length
+            ? 'None of the videos in your queue have a start/end point. Right-click a playing video → Set Start Point / Set End Point.'
+            : 'The queue is empty. Add videos, then right-click a playing video → Set Start Point / Set End Point.';
+        box.appendChild(empty);
+        return;
+    }
+
+    const chip = (kind, val, onCancel) => {
+        const c = document.createElement('span'); c.className = 'sp-chip ' + kind;
+        const t = document.createElement('span'); t.textContent = (kind === 's' ? 'S ' : 'E ') + formatSP(val);
+        const x = document.createElement('button'); x.textContent = '✖'; x.title = kind === 's' ? 'Cancel start point' : 'Cancel end point';
+        x.onclick = onCancel;
+        c.append(t, x);
+        return c;
+    };
+    for (const r of rows) {
+        const row   = document.createElement('div');  row.className  = 'sp-row';
+        const num   = document.createElement('span'); num.className  = 'sp-num';  num.textContent  = r.qi + 1;
+        const name  = document.createElement('span'); name.className = 'sp-name'; name.textContent = r.name || r.id; name.title = r.path || r.name || r.id;
+        const chips = document.createElement('span'); chips.className = 'sp-chips';
+        if (r.s !== null) chips.appendChild(chip('s', r.s, () => {
+            window.clearStartPoint(r.id); renderStartPointList();
+            showToast(`Start point cancelled — ${_spEsc(r.name || r.id)}`, 'success', 'media');
+        }));
+        if (r.e !== null) chips.appendChild(chip('e', r.e, () => {
+            window.clearEndPoint(r.id); renderStartPointList();
+            showToast(`End point cancelled — ${_spEsc(r.name || r.id)}`, 'success', 'media');
+        }));
+        row.append(num, name, chips);
+        box.appendChild(row);
+    }
+}
+
+// ── START / END POINT ACTIONS (shared by right-click menu + shortcut keys) ──
+function getCellVideoAndFile(cell) {
+    const vid = cell?.querySelector('video.media-active') || null;
+    if (!vid) return { vid: null, file: null };
+    const idx  = parseInt(cell.dataset.currentIndex);
+    const file = vid._spFile || ((!isNaN(idx) && idx >= 0) ? window.playlist[idx] : null);
+    return { vid, file };
+}
+
+function setCellPoint(kind, file, t, vid) {
+    if (!file || t == null || !isFinite(t)) return false;
+    const isStart = kind === 'start';
+    if (t < 1) { showToast(`Move the video forward first, then set the ${isStart ? 'start' : 'end'} point`, 'warning', 'media'); return false; }
+    if (isStart) {
+        const ep = window.getEndPoint(file);
+        if (ep != null && t >= ep - 0.5) { showToast(`Start point must be before the end point (${formatSP(ep)})`, 'warning', 'media'); return false; }
+        window.setStartPoint(file, t);
+    } else {
+        const sp = window.getStartPoint(file);
+        if (sp != null && t <= sp + 0.5) { showToast(`End point must be after the start point (${formatSP(sp)})`, 'warning', 'media'); return false; }
+        window.setEndPoint(file, t);
+        if (vid) vid._spSkipEnd = true;      // the video playing right now keeps going this one time
+    }
+    renderStartPointList();
+    showToast(`${isStart ? 'Start' : 'End'} point saved at ${formatSP(t)} — ${_spEsc(file.name)}`, 'success', 'media');
+    return true;
+}
+
+function cancelCellPoint(kind, file) {
+    if (!file) return;
+    const id = window.getStartPointId(file);
+    if (kind === 'start') window.clearStartPoint(id); else window.clearEndPoint(id);
+    renderStartPointList();
+    showToast(`${kind === 'start' ? 'Start' : 'End'} point cancelled — ${_spEsc(file.name)}`, 'success', 'media');
+}
+
+// Shortcut key: 1st press sets the point at the current time, 2nd press cancels it
+function toggleCellPoint(cell, kind) {
+    const { vid, file } = getCellVideoAndFile(cell);
+    if (!vid || !file) { showToast('Hover a playing video cell, then press the key', 'warning', 'media'); return; }
+    const cur = kind === 'start' ? window.getStartPoint(file) : window.getEndPoint(file);
+    if (cur != null) cancelCellPoint(kind, file);
+    else             setCellPoint(kind, file, vid.currentTime, vid);
+}
+
+// Briefly outline a shortcut row (used when a key is already taken)
+function flashKeyConflict(actionId) {
+    const row = document.querySelector(`#keybindList .key-row[data-action="${actionId}"]`);
+    if (!row) return;
+    row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    row.style.transition = 'box-shadow .2s';
+    row.style.boxShadow  = 'inset 0 0 0 2px #ff5555';
+    setTimeout(() => { row.style.boxShadow = ''; }, 1800);
+}
+
 // ── CONTEXT MENU ──────────────────────────────────────────────
 function initContextMenu() {
     ctxMenu    = document.getElementById('gridContextMenu');
@@ -1866,8 +2640,48 @@ function initContextMenu() {
             e.preventDefault();
             window.lastRightClickedCell = cell;
             const idx  = parseInt(cell.dataset.currentIndex);
-            window.ctxTargetIndex = isNaN(idx) ? -1 : idx;
+            // FIX 3: -2 is the private-queue sentinel; treat it the same as
+            // "no playlist index" so we don't try to look up playlist[-2].
+            window.ctxTargetIndex = (!isNaN(idx) && idx >= 0) ? idx : -1;
             const file = window.playlist[window.ctxTargetIndex];
+
+            const isVidInCell = file && ((file.type || '').startsWith('video/') || /\.(mp4|mkv|ts|m2ts|webm|avi|mov|wmv|flv|3gp|ogv)$/i.test(file.name)) && !file.isWeb;
+            const thumbSection = isVidInCell ? `
+                <div class="ctx-separator"></div>
+                <div class="section-title" style="padding:5px 12px;opacity:.6;font-size:.65rem;">Thumbnail</div>
+                <div class="ctx-item" onclick="app.ctxCaptureGridThumbnail()">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                    Capture Frame as Thumbnail
+                </div>
+                <div class="ctx-item" onclick="app.ctxResetGridThumbnail()">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.95"/></svg>
+                    Reset Thumbnail
+                </div>` : '';
+
+            // ── Start / End point items (videos only) ──
+            const { vid: spVid, file: spFile } = getCellVideoAndFile(cell);
+            window.ctxStartFile      = spFile;
+            window.ctxStartPointTime = (spVid && spFile && isFinite(spVid.currentTime)) ? spVid.currentTime : null;
+            let spSection = '';
+            if (window.ctxStartPointTime !== null) {
+                const curS = window.getStartPoint(spFile), curE = window.getEndPoint(spFile);
+                const tNow = formatSP(window.ctxStartPointTime);
+                spSection = `
+                <div class="ctx-separator"></div>
+                <div class="ctx-item ctx-blue" onclick="app.ctxSetStartPoint()">📍 Set Start Point (${tNow})</div>
+                ${curS != null ? `<div class="ctx-item ctx-red" onclick="app.ctxCancelStartPoint()">✖ Cancel Start Point (${formatSP(curS)})</div>` : ''}
+                <div class="ctx-item ctx-amber" onclick="app.ctxSetEndPoint()">🏁 Set End Point (${tNow})</div>
+                ${curE != null ? `<div class="ctx-item ctx-red" onclick="app.ctxCancelEndPoint()">✖ Cancel End Point (${formatSP(curE)})</div>` : ''}`;
+            }
+
+            // Which sections to show: Settings → Options → Right-Click Menu on Cell
+            const sec = window.settings.ctxMenuSections || {};
+            const queueSection = sec.cellQueue === false ? '' : `
+                <div class="section-title" style="padding:5px 12px;margin:4px 0 0;border-top:1px solid #333;opacity:.6;font-size:.65rem;">Cell Queue Loop</div>
+                <div class="ctx-item" onclick="app.addFilesToCell()">📁 Add Files</div>
+                <div class="ctx-item" onclick="app.addFolderToCell()">📂 Add Folder</div>
+                <div class="ctx-item" onclick="app.showCellQueue()">📋 Show Grid List</div>
+                <div class="ctx-item" onclick="app.clearCellQueue()" style="color:#ff5555">❌ Clear List</div>`;
 
             ctxMenu.innerHTML = `
                 <div class="section-title" style="padding:5px 12px;opacity:.6;font-size:.65rem;">Cell Actions</div>
@@ -1879,12 +2693,9 @@ function initContextMenu() {
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                     Show in Folder
                 </div>
-                <div class="section-title" style="padding:5px 12px;margin:4px 0 0;border-top:1px solid #333;opacity:.6;font-size:.65rem;">Cell Queue Loop</div>
-                <div class="ctx-item" onclick="app.addFilesToCell()">📁 Add Files</div>
-                <div class="ctx-item" onclick="app.addFolderToCell()">📂 Add Folder</div>
-                <div class="ctx-item" onclick="app.addFromMainToCell()">📥 Copy Main Queue</div>
-                <div class="ctx-item" onclick="app.showCellQueue()">📋 Show Grid List</div>
-                <div class="ctx-item" onclick="app.clearCellQueue()" style="color:#ff5555">❌ Clear List</div>`;
+                ${sec.startEnd  === false ? '' : spSection}
+                ${sec.thumbnail === false ? '' : thumbSection}
+                ${queueSection}`;
             _showMenu(ctxMenu, e.clientX, e.clientY);
             return;
         }
@@ -1898,6 +2709,14 @@ function initContextMenu() {
             _showMenu(plyCtxMenu, e.clientX, e.clientY);
             const fb  = document.getElementById('ctxPlyFolder');
             if (fb) fb.classList.toggle('disabled', !f?.path || f.isWeb || f.path.startsWith('http'));
+            // Feature 1: Show/hide thumbnail option for videos only
+            const isVid = f && ((f.type || '').startsWith('video/') || /\.(mp4|mkv|ts|m2ts|webm|avi|mov|wmv|flv|3gp|ogv)$/i.test(f.name));
+            const thumbBtn  = document.getElementById('ctxPlyChangeThumbnail');
+            const resetBtn  = document.getElementById('ctxPlyResetThumbnail');
+            if (thumbBtn)  thumbBtn.style.display  = (isVid && !f?.isWeb) ? 'flex' : 'none';
+            if (resetBtn)  resetBtn.style.display  = (isVid && !f?.isWeb) ? 'flex' : 'none';
+            const sep = plyCtxMenu.querySelector('.ctx-separator');
+            if (sep) sep.style.display = (isVid && !f?.isWeb) ? 'block' : 'none';
         }
     });
 
@@ -1926,7 +2745,7 @@ function closeContextMenu() {
 
 // ── DRAGGABLE MODALS ──────────────────────────────────────────
 function setupDraggableModals() {
-    ['settingsModal','liveFolderModal','exitModal','webVideoModal'].forEach(id => {
+    ['settingsModal','liveFolderModal','exitModal','webVideoModal','startPointsModal','startPointsClearModal'].forEach(id => {
         const overlay = document.getElementById(id); if (!overlay) return;
         const modal   = overlay.querySelector('.modal');
         const header  = overlay.querySelector('.modal-header');
