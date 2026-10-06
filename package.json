@@ -1,6 +1,6 @@
 {
   "name": "ultimate-player",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Ultimate Player",
   "main": "main.js",
   "scripts": {
@@ -8,12 +8,12 @@
     "dist": "electron-builder"
   },
   "keywords": [],
-  "author": "PoXeR (Coded by Gemeni 3)",
+  "author": "HighL1ght",
   "license": "ISC",
   "devDependencies": {
     "@electron/rebuild": "^4.0.4",
     "electron": "^42.3.0",
-    "electron-builder": "^26.15.0",
+    "electron-builder": "^26.15.3",
     "exceljs": "^4.4.0"
   },
   "overrides": {
