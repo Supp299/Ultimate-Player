@@ -117,11 +117,8 @@
             <div id="serverInfoDisplay" class="server-info"></div>
         </div>
 
-        <!-- Credits -->
-        <div class="creator-box">
-            <span class="cb-made">Made by Gemeni 3</span>
-            <span class="cb-idea" style="font-weight: bold;font-size: larger;color:white;">Idea : PoXzeR</span>
-        </div>
+
+
     </div>
 
     <!-- MAIN APP INTERFACE -->
@@ -178,8 +175,7 @@
             <img id="imageViewer">
             <div id="gridContainer"></div>
             
-            <!-- Keybind Hints Footer -->
-            <div id="shortcutsFooter" class="shortcuts-footer"></div>
+
         </div>
 
         <!-- Resize Handle -->
@@ -280,7 +276,7 @@
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>
                         </span>
                         <input type="range" id="globalVolSlider" min="0" max="1" step="0.05" value="1" title="Global Volume Control">
-                        <span id="globalVolDisplay" style="font-size:0.8rem; width:35px; text-align:right; font-variant-numeric:tabular-nums;">100%</span>
+                        <span id="globalVolDisplay" style="font-size:0.8rem; min-width:35px; flex-shrink:0; white-space:nowrap; text-align:right; font-variant-numeric:tabular-nums;">100%</span>
                     </div>
 
                     <!-- Playback Speed -->
@@ -768,7 +764,7 @@
                 </button>
 
                 <div class="setting-group" style="margin-top: 20px;">
-                    <label>Transition Effect (15 New Styles)</label>
+                    <label>Image Transition Effect</label>
                     <div style="display: flex; gap: 10px; align-items: center;">
                         <select id="effectSelect" style="flex: 1;">
                             <option value="none">0. No Effect</option>
@@ -787,12 +783,44 @@
                             <option value="flash">13. Flash</option>
                             <option value="swing">14. Swing</option>
                             <option value="glitch">15. Glitch</option>
+                            <option value="rise">16. Rise Up</option>
+                            <option value="diagonal">17. Diagonal Drift</option>
+                            <option value="ripple">18. Ripple</option>
+                            <option value="curtain">19. Curtain</option>
+                            <option value="morph">20. Morph Fade</option>
+                            <option value="bounce">21. Bounce Drop</option>
+                            <option value="vortex">22. Vortex</option>
+                            <option value="shatter">23. Shatter</option>
                         </select>
                         <div style="display: flex; align-items: center; gap: 5px;" title="Pick a random effect for every image">
                             <input type="checkbox" id="randomEffectToggle" style="width: 18px; height: 18px;">
                             <label for="randomEffectToggle" style="margin: 0; font-size: 0.8rem; cursor: pointer; white-space: nowrap;">Random</label>
                         </div>
                     </div>
+                </div>
+
+                <div class="setting-group" style="margin-top: 12px;">
+                    <label>Video Transition Effect</label>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <select id="videoEffectSelect" style="flex: 1;">
+                            <option value="none">No Effect (instant)</option>
+                            <option value="fade-vid">Fade</option>
+                            <option value="zoom-in-vid">Zoom In</option>
+                            <option value="zoom-out-vid">Zoom Out</option>
+                            <option value="slide-up-vid">Slide Up</option>
+                            <option value="slide-dn-vid">Slide Down</option>
+                            <option value="slide-l-vid">Slide Left</option>
+                            <option value="slide-r-vid">Slide Right</option>
+                            <option value="blur-vid">Blur Reveal</option>
+                            <option value="morph-vid">Morph Fade</option>
+                            <option value="curtain-vid">Curtain</option>
+                        </select>
+                        <div style="display: flex; align-items: center; gap: 5px;" title="Pick a random video effect for every video">
+                            <input type="checkbox" id="randomVideoEffectToggle" style="width: 18px; height: 18px;">
+                            <label for="randomVideoEffectToggle" style="margin: 0; font-size: 0.8rem; cursor: pointer; white-space: nowrap;">Random</label>
+                        </div>
+                    </div>
+                    <label style="font-size:0.7rem; color:#666; margin-top:4px; display:block;">(Uses effect speed above. May cause brief visual overlap.)</label>
                 </div>
 
                 <div class="visual-header options-header" onclick="app.toggleTransitionSettings()" style="margin-top:10px; margin-bottom:10px;">
@@ -852,18 +880,6 @@
                 <div id="optionsBody" class="visual-body options-body collapsed">
                     <div style="padding: 10px;">
                         <div class="check-row">
-                            <label>OLED Mode (Pure Black)</label>
-                            <input type="checkbox" id="oledToggle">
-                        </div>
-                        <div class="check-row">
-                             <label>Stay awake (phone)</label>
-                            <input type="checkbox" id="wakeLockToggle">
-                        </div>
-                        <div class="check-row">
-                            <label>Show Keyboard Shortcuts Bar</label>
-                            <input type="checkbox" id="shortcutsToggle" checked>
-                        </div>
-                        <div class="check-row">
                             <label>Advance option for ratio</label>
                             <input type="checkbox" id="advanceRatioToggle">
                         </div>
@@ -900,6 +916,29 @@
                         <label style="font-size:0.7rem; color:#666; display:block; margin-bottom:10px;">
                             (Offloads Image processing to CPU to keep GPU free for Videos.)
                         </label>
+                        <div class="check-row">
+                            <label>Volume Boost (up to 1000%)</label>
+                            <input type="checkbox" id="volumeBoostToggle">
+                        </div>
+                        <label style="font-size:0.7rem; color:#666; display:block; margin-bottom:10px;">
+                            (Unlocks volume above 100% on the sidebar and cell volume sliders. Very high levels can distort.)
+                        </label>
+                        <div class="section-title" style="margin-top:12px;">Right-Click Menu on Cell</div>
+                        <div class="check-row">
+                            <label>📍 Start / End Point</label>
+                            <input type="checkbox" id="ctxSecStartEnd" onchange="app.setCtxSection('startEnd', this.checked)">
+                        </div>
+                        <div class="check-row">
+                            <label>🖼️ Thumbnail</label>
+                            <input type="checkbox" id="ctxSecThumb" onchange="app.setCtxSection('thumbnail', this.checked)">
+                        </div>
+                        <div class="check-row">
+                            <label>🔁 Cell Queue Loop</label>
+                            <input type="checkbox" id="ctxSecQueue" onchange="app.setCtxSection('cellQueue', this.checked)">
+                        </div>
+                        <label style="font-size:0.7rem; color:#666; display:block; margin-bottom:10px;">
+                            (Choose which sections appear when you right-click a grid cell.)
+                        </label>
                         <div class="check-row" style="border-top: 1px solid #444; padding-top: 10px; margin-top: 5px;">
                             <label style="color: #ec4899; font-weight: bold;">Enable Live Folder Motion</label>
                             <input type="checkbox" id="liveFolderToggle">
@@ -929,6 +968,29 @@
                         <div id="keybindList"></div>
                         <button class="upload-btn secondary" id="resetKeysBtn" style="width:100%; margin-top:10px;">Reset Default Keys</button>
                     </div>
+                </div>
+
+                <!-- Clear Cache Button (Feature 2) -->
+                <div class="visual-header" style="margin-top:20px; cursor:default; pointer-events:none;">
+                    <span style="color:#f87171;">🗑️ Cache Management</span>
+                </div>
+                <div style="padding:10px 0;">
+                    <button class="upload-btn" id="clearThumbCacheBtn" style="width:100%; background:linear-gradient(135deg,#7f1d1d,#991b1b); border:1px solid #f87171; color:#fca5a5; display:flex; align-items:center; justify-content:center; gap:8px;">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+                        Clear All Thumbnails &amp; Res/Ratio Cache
+                    </button>
+                    <label style="font-size:0.7rem; color:#666; display:block; margin-top:5px; text-align:center;">(Deletes saved thumbnails &amp; metadata from disk. Frees disk space.)</label>
+                </div>
+
+                <!-- Saved Start Points -->
+                <div class="visual-header" style="margin-top:20px; cursor:default; pointer-events:none;">
+                    <span style="color:#60a5fa;">📍 Start / End Points</span>
+                </div>
+                <div style="padding:10px 0;">
+                    <button class="upload-btn primary-folder-btn" onclick="app.openStartPointsManager()" style="width:100%; height:44px; flex-direction:row; gap:10px; border:1px solid #3b82f6; color:#93c5fd;">
+                        📍 Open Start / End Points Manager
+                    </button>
+                    <label style="font-size:0.7rem; color:#666; display:block; margin-top:5px; text-align:center;">(See which queue videos start/end at a saved time, cancel them, or delete all.)</label>
                 </div>
                 
             </div>
@@ -1032,6 +1094,43 @@
             </div>
         </div>
     </div>
+    <!-- START POINTS MANAGER MODAL -->
+    <div class="modal-overlay" id="startPointsModal">
+        <div class="modal" style="width: 520px; height: 540px;">
+            <div class="modal-header">
+                <h2 style="color:#60a5fa;">📍 Start / End Points <span id="startPointCount" style="opacity:.7; font-weight:normal; font-size:0.9rem;"></span></h2>
+            </div>
+            <div class="modal-body" style="display: flex; flex-direction: column; gap: 12px;">
+                <p style="color: #888; font-size: 0.85rem; margin: 0;">
+                    Videos in your queue with a saved start (S) and/or end (E) point.
+                </p>
+                <div id="startPointList" class="sp-list"></div>
+                <div id="startPointOtherNote" class="sp-note" style="display:none;"></div>
+                <button class="upload-btn sp-delall" id="clearAllStartPointsBtn" onclick="app.askClearAllStartPoints()" title="Delete every saved start and end point">🗑️ Delete All</button>
+            </div>
+            <div class="modal-footer">
+                <button class="close-btn" onclick="app.closeStartPointsManager()">Close</button>
+            </div>
+        </div>
+    </div>
+    <!-- CLEAR ALL START POINTS CONFIRMATION MODAL -->
+    <div class="modal-overlay" id="startPointsClearModal">
+        <div class="modal" style="width: 340px; height: auto;">
+            <div class="modal-header" style="justify-content: center; background: rgba(255, 85, 85, 0.1);">
+                <h2 style="color: #ff5555;">⚠ Delete All Start &amp; End Points?</h2>
+            </div>
+            <div class="modal-body" style="text-align: center; padding: 30px 20px;">
+                <p style="color: var(--text-muted); margin: 0; font-size: 1rem; line-height: 1.5;">
+                    This will remove all saved start and end points (<strong id="spClearCount">0</strong> video(s)). Every video will play in full again.
+                    <br><strong style="color:#ff5555;">This cannot be undone.</strong>
+                </p>
+            </div>
+            <div class="modal-footer" style="display: flex; gap: 10px; justify-content: center;">
+                <button class="upload-btn secondary" onclick="app.closeClearStartPointsModal()" style="flex: 1;">Cancel</button>
+                <button class="upload-btn" onclick="app.confirmClearAllStartPoints()" style="flex: 1; background-color: #ff5555;">Delete All</button>
+            </div>
+        </div>
+    </div>
     <!-- CONTEXT MENU (Hidden by default) -->
     <div id="gridContextMenu" class="context-menu">
         <div class="ctx-item" onclick="app.ctxShowInQueue()">
@@ -1052,8 +1151,43 @@
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
             Show in Grid (Random)
         </div>
+        <div class="ctx-separator"></div>
+        <div class="ctx-item" id="ctxPlyChangeThumbnail" onclick="app.ctxPlyCaptureThumbnailFromGrid()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            Change Thumbnail (from Grid)
+        </div>
+        <div class="ctx-item" id="ctxPlyResetThumbnail" onclick="app.ctxPlyResetThumbnail()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.95"/></svg>
+            Reset Thumbnail
+        </div>
     </div>
     <div id="toast-container"></div>
+
+    <!-- ── RECENT QUEUE RESTORE MODAL ───────────────────────── -->
+    <div id="restoreQueueModal" class="rq-modal-backdrop" style="display:none;" aria-modal="true" role="dialog" aria-labelledby="rqTitle">
+        <div class="rq-modal">
+            <div class="rq-icon">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                    <path d="M3 3v5h5"/>
+                    <polyline points="12 7 12 12 15 15"/>
+                </svg>
+            </div>
+            <h3 id="rqTitle" class="rq-title">Restore Last Session?</h3>
+            <p class="rq-subtitle" id="rqSubtitle">Loading…</p>
+            <div class="rq-file-preview" id="rqFilePreview"></div>
+            <div class="rq-actions">
+                <button class="rq-btn rq-btn-yes" id="rqYesBtn">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                    Yes, Restore
+                </button>
+                <button class="rq-btn rq-btn-cancel" id="rqCancelBtn">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    Cancel
+                </button>
+            </div>
+        </div>
+    </div>
 
     <script src="store.js"></script>
     <script src="grid.js"></script>
