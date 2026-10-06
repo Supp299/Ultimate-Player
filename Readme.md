@@ -1,8 +1,8 @@
-Hello there.its PoXzeR!
+Hello there!
 
 This is Ultimate Player for play images and videos as slideshow at togheter with conttroble girds(cells).
 
-This app coded by GEMINI 3.
+This app coded by GEMINI 3 and upgrade with claude. 
 
 The main focuse is on slideshow and layout editor
 
